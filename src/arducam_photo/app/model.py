@@ -84,8 +84,8 @@ class SessionModel:
             raise ModeError("réglage du focus uniquement en Preview")
         if not FOCUS_MIN <= value <= FOCUS_MAX:
             raise CaptureConfigError(f"focus hors plage {FOCUS_MIN}..{FOCUS_MAX}")
+        self.controller.set_focus(value)  # may raise ModeError: draft untouched then
         self.draft = dataclasses.replace(self.draft, focus_requested=int(value), focus_readback=None)
-        self.controller.set_focus(value)
 
     def save_profile(self) -> ShootingProfile:
         if self.draft is None:

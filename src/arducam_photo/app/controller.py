@@ -172,7 +172,7 @@ class CameraController:
 
     def _submit(self, cmd) -> None:
         with self._lock:
-            if self._thread is None:
+            if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._run, name="camera-worker", daemon=True)
                 self._thread.start()
         self._q.put(cmd)
@@ -282,7 +282,7 @@ class CameraController:
                 del result  # free ~324 MB of pixels promptly
             self._emit("capture_done", path=path, thumbnail=thumb, info=info, size=size)
         except Exception as e:
-            self._emit("capture_failed", error=e, recoverable=isinstance(e, CaptureError))
+            self._emit("capture_failed", error=e, recoverable=isinstance(e, (CaptureError, OSError)))
         finally:
             self._set_state(IDLE)  # the engine has released the camera in every case
             self._emit("capture_idle")

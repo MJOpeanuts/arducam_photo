@@ -324,5 +324,6 @@ class CameraWidget(QWidget):
     def closeEvent(self, e):
         if not self.can_close():
             e.ignore(); return
-        self.shutdown()
+        if not self.shutdown():
+            self._info("La caméra n'a pas répondu dans les 10 s ; elle peut rester occupée jusqu'à la fin de l'appel natif.")
         e.accept()
