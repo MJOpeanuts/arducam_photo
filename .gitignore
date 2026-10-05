@@ -6,6 +6,8 @@ build/
 dist/
 *.png
 *.jpg
+!/docs/screenshots/preview.png
+!/docs/screenshots/capture.png
 # Ignore tuning files except the bundled package resource.
 arducam_108mp.json
 !/src/arducam_photo/resources/arducam_108mp.json
