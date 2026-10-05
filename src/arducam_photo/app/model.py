@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 from typing import Callable, Optional
 
+from ..bundled_ccm import bundled_ccm_path
+from ..ccm import load_ccm_file
 from ..config import COLOR_720P, NATIVE_108MP, CaptureConfig
 from ..errors import CaptureConfigError
 from .controller import CameraController, CaptureJob, ModeError
@@ -43,6 +46,8 @@ class SessionModel:
         self.saved: Optional[ShootingProfile] = None
         self.draft: Optional[ShootingProfile] = None
         self.last_photo: Optional[str] = None
+        self._resources = contextlib.ExitStack()
+        self._bundled: Optional[str] = None
 
     # ---- start screen ----
     def select_camera(self, index: int) -> None:
@@ -63,6 +68,14 @@ class SessionModel:
     def set_ccm_path(self, path: str) -> None:
         self._update_settings(ccm_path=path)
         self.controller.verify_ccm(path)
+
+    def effective_ccm_path(self) -> str:
+        """Explicit user choice wins; otherwise the bundled resource (CaptureConfigError if absent)."""
+        if self.settings.ccm_path:
+            return self.settings.ccm_path
+        if self._bundled is None:
+            self._bundled = bundled_ccm_path(self._resources)
+        return self._bundled
 
     def photo_dir(self) -> str:
         return resolve_photo_dir(self.settings.photo_dir)
@@ -145,10 +158,8 @@ class SessionModel:
         profile = self.saved
         if profile is None or not profile.is_valid:
             raise ProfileMissing("aucun profil valide: passez par Preview / Réglages")
-        ccm = self.settings.ccm_path
         native = profile.path == NATIVE_108MP
-        if native and not ccm:
-            raise CaptureConfigError("correction couleur requise: sélectionnez arducam_108mp.json")
+        ccm = self.effective_ccm_path() if native else None
         cfg = CaptureConfig(camera_index=profile.camera_index, api=profile.api, path=profile.path,
                             focus=profile.focus_requested, ccm_path=ccm if native else None,
                             apply_ccm=native)
@@ -158,12 +169,20 @@ class SessionModel:
     def ccm_status(self) -> str:
         if (self.saved.path if self.saved else self.path) != NATIVE_108MP:
             return "Correction couleur : non applicable (720p)"
-        if not self.settings.ccm_path:
-            return "Correction couleur : NON CONFIGURÉE (capture 108 MP refusée)"
-        return f"Correction couleur : activée ({self.settings.ccm_path})"
+        try:
+            path = self.effective_ccm_path()
+            load_ccm_file(path)
+        except CaptureConfigError as e:
+            return f"Correction couleur : ERREUR, capture 108 MP refusée ({e})"
+        source = "fichier choisi" if self.settings.ccm_path else "ressource intégrée"
+        return f"Correction couleur : activée ({source}: {path})"
 
     def shutdown(self, timeout: Optional[float] = None) -> bool:
-        return self.controller.shutdown(timeout)
+        done = self.controller.shutdown(timeout)
+        if done:
+            self._resources.close()
+            self._bundled = None
+        return done
 
     # ---- controller events ----
     def _on_event(self, event: str, **kw) -> None:
