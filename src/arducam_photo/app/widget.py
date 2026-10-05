@@ -113,6 +113,7 @@ class CameraWidget(QWidget):
             QSlider::handle:horizontal:focus { background: #FF963F; }
             QSlider::handle:horizontal:disabled { background: #727679; }
             QScrollArea { border: 1px solid #343739; border-radius: 6px; }
+            QScrollArea#startSettings { border: none; }
             QToolButton#diagnostic { color: #A4A7A9; background: transparent; border: none;
                 text-align: left; padding-left: 0; }
             QToolButton#diagnostic:focus { border: 1px solid #FF963F; }
@@ -147,10 +148,15 @@ class CameraWidget(QWidget):
             sl.addWidget(w)
         row = QHBoxLayout(); row.addWidget(self.btn_to_preview); row.addWidget(self.btn_to_capture)
         sl.addLayout(row); sl.addStretch()
+        self.start_scroll = QScrollArea()
+        self.start_scroll.setObjectName("startSettings")
+        self.start_scroll.setAccessibleName("Configuration de la caméra")
+        self.start_scroll.setWidgetResizable(True)
+        self.start_scroll.setWidget(s)
         # preview page
         p = QWidget(); pl = QVBoxLayout(p)
         self.btn_p_capture = self._mode_button("Capture", self._go_capture)
-        self._header(pl, "Preview / Réglages", self.btn_p_capture)
+        self._header(pl, "Preview / Réglages")
         self.video = ImageView("Aucun flux")
         self.video.setAccessibleName("Aperçu de la caméra")
         pl.addWidget(self.video, 1)
@@ -158,6 +164,7 @@ class CameraWidget(QWidget):
         self.btn_fullscreen.setToolTip("Afficher uniquement l’image · Échap pour revenir")
         self.btn_fullscreen.setAccessibleName("Aperçu en plein écran")
         self.btn_fullscreen.clicked.connect(self._show_fullscreen)
+        self.btn_fullscreen.setEnabled(False)
         full_row = QHBoxLayout(); full_row.addStretch(); full_row.addWidget(self.btn_fullscreen)
         pl.addLayout(full_row)
         self.fps_label = QLabel("FPS acquis : – | affichés : –")
@@ -182,20 +189,22 @@ class CameraWidget(QWidget):
         focus_row.addWidget(QLabel("Focus manuel"))
         focus_row.addWidget(self.focus_slider, 1); focus_row.addWidget(self.focus_spin)
         focus_row.addWidget(self.btn_save); focus_row.addWidget(self.unsaved)
+        focus_row.addWidget(self.btn_p_capture)
         pl.addLayout(focus_row); pl.addWidget(self.preview_msg)
         self.preview_details = QLabel(); self.preview_details.setWordWrap(True)
         self._diagnostic(pl, "preview", (self.fps_label, self.focus_state, self.preview_details))
         # capture page
         c = QWidget(); cl = QVBoxLayout(c)
-        self.btn_c_preview = self._mode_button("Preview / Réglages", self._go_preview)
-        self._header(cl, "Capture", self.btn_c_preview)
+        self.btn_c_preview = self._mode_button("Preview", self._go_preview)
+        self._header(cl, "Profil enregistré")
         self.profile_label = QLabel(); self.profile_label.setWordWrap(True)
         self.profile_label.setObjectName("muted")
-        cl.addWidget(QLabel("Profil enregistré")); cl.addWidget(self.profile_label)
+        cl.addWidget(self.profile_label)
         self.ccm_label2 = QLabel(); self.ccm_label2.setWordWrap(True)
         self.btn_trigger = QPushButton("PHOTO"); self.btn_trigger.setObjectName("photo")
         self.btn_trigger.setIcon(lucide_icon("squirrel", "#21180E", 24))
-        self.btn_trigger.setMinimumHeight(38)
+        self.btn_trigger.setMinimumSize(160, 48)
+        self.btn_trigger.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.btn_trigger.setAccessibleName("Prendre une photo")
         self.btn_trigger.setToolTip("Capturer avec le profil enregistré")
         self.btn_trigger.clicked.connect(self._trigger)
@@ -209,36 +218,40 @@ class CameraWidget(QWidget):
         self.btn_open_last = QPushButton("Ouvrir la dernière photo"); self.btn_open_last.clicked.connect(self._open_last)
         for button in (self.btn_open_dir, self.btn_open_last):
             button.setFixedHeight(38)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
             button.setToolTip(button.text())
             button.setAccessibleName(button.text())
         action_row = QHBoxLayout()
         action_row.addWidget(self.btn_trigger); action_row.addWidget(self.step_label, 1)
+        action_row.addStretch(1)
         action_row.addWidget(self.btn_open_dir); action_row.addWidget(self.btn_open_last)
+        action_row.addWidget(self.btn_c_preview)
         cl.addLayout(action_row); cl.addWidget(self.result_label)
         self.result_label.hide(); self.step_label.hide()
         self.capture_details = QLabel(); self.capture_details.setWordWrap(True)
         self._diagnostic(cl, "capture", (self.ccm_label2, self.capture_details))
-        for page in (s, p, c):
+        for page in (self.start_scroll, p, c):
             self.stack.addWidget(page)
         lay = QVBoxLayout(self); lay.setContentsMargins(16, 12, 16, 12); lay.addWidget(self.stack)
 
     def _mode_button(self, text, callback):
         button = QPushButton(text)
         button.setObjectName("mode")
+        button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         button.setIcon(lucide_icon("refresh-cw", "#202326", 18))
         button.setAccessibleName(f"Passer en {text}")
         button.setToolTip(f"Passer en {text}")
         button.clicked.connect(callback)
         return button
 
-    def _header(self, layout, title, button):
+    def _header(self, layout, title):
         row = QHBoxLayout()
         icon = QLabel()
         icon.setPixmap(lucide_icon("squirrel", "#FF963F", 30).pixmap(QSize(30, 30)))
         icon.setAccessibleName("Arducam")
         row.addWidget(icon); row.addStretch()
         label = QLabel(title); label.setObjectName("title")
-        row.addWidget(label); row.addSpacing(16); row.addWidget(button)
+        row.addWidget(label)
         layout.addLayout(row)
 
     def _diagnostic(self, layout, name, widgets):
@@ -249,7 +262,7 @@ class CameraWidget(QWidget):
         toggle.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         toggle.setAccessibleName("Afficher ou masquer le diagnostic")
         toggle.setToolTip("Informations techniques et détails des erreurs")
-        area = QScrollArea(); area.setWidgetResizable(True); area.setFixedHeight(150)
+        area = QScrollArea(); area.setWidgetResizable(True); area.setMaximumHeight(150)
         content = QWidget(); inner = QVBoxLayout(content)
         for widget in widgets:
             widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -263,6 +276,8 @@ class CameraWidget(QWidget):
         setattr(self, f"{name}_diagnostic", area)
 
     def _show_fullscreen(self):
+        if self.video.source.isNull():
+            return
         if self._fullscreen is not None:
             return
         dialog = QDialog(self)
@@ -322,8 +337,9 @@ class CameraWidget(QWidget):
 
     def _show_page(self, mode: str) -> None:
         self.stack.setCurrentIndex(self.PAGES[mode])
-        self.ccm_label.setText(self.model.ccm_status())
-        self.ccm_label2.setText(self.model.ccm_status())
+        ccm_status = self.model.ccm_status()
+        self.ccm_label.setText(ccm_status)
+        self.ccm_label2.setText(ccm_status)
         self.folder_label.setText(f"Dossier des photos : {self.model.photo_dir()}")
         self._refresh_diagnostic()
         self._refresh_open_buttons()
@@ -335,15 +351,18 @@ class CameraWidget(QWidget):
                     f"Focus {prof.focus_requested if prof.focus_requested is not None else '–'}")
             else:
                 self.profile_label.setText("Aucun profil valide : passez par Preview / Réglages.")
+            if ccm_status.startswith("Correction couleur : ERREUR"):
+                self.result_label.setText(
+                    "Correction couleur indisponible : capture 108 MP impossible. Voir Diagnostic.")
+                self.result_label.show()
+            elif self.result_label.text().startswith("Correction couleur indisponible"):
+                self.result_label.clear()
+                self.result_label.hide()
             self._set_capture_busy(self.model.controller.state == "capturing")
             self._fps_timer.stop()
             if self._fullscreen is not None:
                 self._fullscreen.reject()
         elif mode == PREVIEW_MODE:
-            d = self.model.draft
-            value = d.focus_requested if d and d.focus_requested is not None else FOCUS_MIN - 1
-            for control in (self.focus_slider, self.focus_spin):
-                control.blockSignals(True); control.setValue(value); control.blockSignals(False)
             self.preview_msg.clear(); self.preview_msg.hide()
             self._fps_timer.start()
             self._refresh_preview_state()
@@ -426,12 +445,22 @@ class CameraWidget(QWidget):
         return SAVE if clicked is b_save else DISCARD if clicked is b_drop else STAY
 
     def _focus_input(self, value: int, from_slider: bool) -> None:
-        if value < FOCUS_MIN or self.model.mode != PREVIEW_MODE:
+        if self.model.mode != PREVIEW_MODE:
             return
-        other = self.focus_spin if from_slider else self.focus_slider
-        other.blockSignals(True); other.setValue(value); other.blockSignals(False)
-        self._guard(self.model.set_focus, value)
+        if value >= FOCUS_MIN:
+            self._guard(self.model.set_focus, value)
         self._refresh_preview_state()
+
+    def _sync_focus_controls(self, requested: Optional[int]) -> None:
+        known = requested is not None
+        self.focus_slider.blockSignals(True)
+        self.focus_spin.blockSignals(True)
+        self.focus_spin.setRange(FOCUS_MIN if known else FOCUS_MIN - 1, FOCUS_MAX)
+        self.focus_spin.setSpecialValueText("" if known else "non défini")
+        self.focus_spin.setValue(requested if known else FOCUS_MIN - 1)
+        self.focus_slider.setValue(requested if known else FOCUS_MIN)
+        self.focus_spin.blockSignals(False)
+        self.focus_slider.blockSignals(False)
 
     def _save(self):
         if self._guard(self.model.save_profile) is not None:
@@ -483,6 +512,7 @@ class CameraWidget(QWidget):
                     self.fullscreen_video.setPixmap(pixmap)
         elif event == "video_cleared":
             self.video.clear(); self.video.setText("Aucun flux")
+            self.btn_fullscreen.setEnabled(False)
             if self._fullscreen is not None:
                 self._fullscreen.reject()
         elif event == "mode_changed":
@@ -505,8 +535,15 @@ class CameraWidget(QWidget):
             self._refresh_diagnostic()
         elif event == "capture_step":
             self._set_capture_busy(True)
-            self.step_label.setText(kw["step"])
+            step = kw["step"]
+            self._technical["Étape du contrôleur"] = step
+            self.step_label.setText({
+                "Préparation et vérification du profil": "Préparation du profil",
+                "Acquisition et traitement (moteur, appel bloquant)": "Acquisition et traitement",
+                "Enregistrement du PNG": "Enregistrement PNG",
+            }.get(step, step))
             self.step_label.show()
+            self._refresh_diagnostic()
         elif event == "capture_done":
             w, h = kw["size"]
             info = kw["info"]
@@ -537,6 +574,7 @@ class CameraWidget(QWidget):
         d = self.model.draft
         if d is None:
             return
+        self._sync_focus_controls(d.focus_requested)
         rb = "–" if d.focus_readback is None else f"{d.focus_readback:g}"
         req = "–" if d.focus_requested is None else str(d.focus_requested)
         self.focus_state.setText(f"Focus manuel : consigne {req} | valeur relue {rb} "

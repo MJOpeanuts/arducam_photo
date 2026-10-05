@@ -112,4 +112,14 @@ PYTHONPATH=src QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python -m pytest te
 python -m pip wheel . --no-deps -w /tmp/arducam-wheel
 ```
 
-Ces tests couvrent l’unicité du statut, le focus restauré, le redimensionnement sans nouvelle frame, les proportions, le plein écran/Échap, le Diagnostic, les ressources SVG, l’accessibilité des commandes à 1280 × 720, les états occupé/erreur et les boutons d’ouverture. Les facteurs Qt 100/125/150 % sous Linux ne remplacent **pas** une validation Windows : vérifier encore Segoe UI, survol/focus/désactivation, plein écran et absence de texte coupé sur un écran Windows 1280 × 720 à chaque mise à l’échelle, ainsi que tous les essais matériels ci-dessus.
+Exécuté pour cette refonte : **76 tests réussis** pour la suite complète à 100 %, **23 tests d’interface réussis** à chacun des facteurs 125 % et 150 %, construction du wheel et chargement des SVG depuis un package installé hors du dépôt.
+
+Ces tests couvrent l’unicité du statut (y compris un échec de sauvegarde), le focus restauré, le redimensionnement sans nouvelle frame, les proportions, le plein écran/Échap, le Diagnostic, les ressources SVG, les états normal/survol/focus/désactivé, les boutons d’ouverture et les transitions du contrôleur. Les commandes restent accessibles dans les zones logiques 1280 × 720, 1024 × 576, 854 × 480 et 838 × 400 (marge pour la barre des tâches et les décorations), sans agrandissement forcé de la fenêtre, même Diagnostic ouvert.
+
+Les facteurs Qt 100/125/150 % sous Linux ne remplacent **pas** une validation Windows : vérifier encore Segoe UI, survol/focus/désactivation, plein écran et absence de texte coupé sur un écran Windows 1280 × 720 à chaque mise à l’échelle, ainsi que tous les essais matériels ci-dessus.
+
+Captures du **rendu réel Qt**, à 1280 × 720, issues du test de transitions avec caméra simulée (frames noires), et non de maquettes. L’heure affichée vient du fichier produit par le test ; aucune image de démonstration n’est chargée par l’application.
+
+| Preview / Réglages | Capture après enregistrement |
+| --- | --- |
+| ![Preview rendu par Qt](docs/screenshots/preview.png) | ![Capture rendu par Qt](docs/screenshots/capture.png) |

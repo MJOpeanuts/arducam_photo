@@ -10,9 +10,9 @@ import pytest
 
 pytest.importorskip("PySide6")
 from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QEnterEvent, QImage
+from PySide6.QtGui import QEnterEvent, QImage, QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QToolButton
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QScrollArea, QToolButton
 
 from arducam_photo.app.widget import CameraWidget, bgr_to_qimage
 from arducam_photo.app.model import SessionModel
@@ -94,6 +94,22 @@ def test_save_status_is_unique_and_focus_restored(widget, qapp):
     assert widget.preview_msg.text() != "Réglages enregistrés."
 
 
+def test_save_failure_keeps_dirty_status(widget, qapp, monkeypatch):
+    show_mode(widget, PREVIEW_MODE, qapp)
+    widget.model.draft = dataclasses.replace(widget.model.saved, focus_requested=301)
+
+    def fail_save(profile):
+        raise OSError("profile-storage-test-failure")
+
+    monkeypatch.setattr(widget.model.profiles, "save", fail_save)
+    widget._save()
+    assert widget.unsaved.text() == "Modifications non enregistrées"
+    assert widget.model.saved.focus_requested == 300
+    assert widget.preview_msg.isVisible()
+    assert "profile-storage-test-failure" not in widget.preview_msg.text()
+    assert "profile-storage-test-failure" in widget.preview_details.text()
+
+
 @pytest.mark.parametrize("mode,image_name", [(PREVIEW_MODE, "video"), (CAPTURE_MODE, "photo")])
 def test_image_rescales_without_new_frame(widget, qapp, mode, image_name):
     show_mode(widget, mode, qapp)
@@ -136,7 +152,9 @@ def test_fullscreen_escape(widget, qapp):
 
 
 @pytest.mark.parametrize("mode", [PREVIEW_MODE, CAPTURE_MODE])
-def test_diagnostic_collapses_without_reserved_space(widget, qapp, mode):
+@pytest.mark.parametrize("window_size", [(1280, 720), (838, 400)])
+def test_diagnostic_collapses_without_reserved_space(widget, qapp, mode, window_size):
+    widget.resize(*window_size)
     show_mode(widget, mode, qapp)
     button = next(b for b in widget.findChildren(QToolButton)
                   if b.isVisible() and "Diagnostic" in b.text())
@@ -145,6 +163,9 @@ def test_diagnostic_collapses_without_reserved_space(widget, qapp, mode):
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
     qapp.processEvents()
     assert button.isChecked()
+    assert (widget.width(), widget.height()) == window_size
+    area = next(a for a in widget.findChildren(QScrollArea) if a.isVisible())
+    assert area.height() <= 150 and area.widgetResizable()
     assert (widget.video if mode == PREVIEW_MODE else widget.photo).height() < height
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)
     qapp.processEvents()
@@ -189,10 +210,11 @@ def test_bundled_svg_icons(qapp):
 
 
 @pytest.mark.parametrize("mode", [PREVIEW_MODE, CAPTURE_MODE])
-@pytest.mark.parametrize("window_size", [(1280, 720), (1024, 576), (854, 480)])
+@pytest.mark.parametrize("window_size", [(1280, 720), (1024, 576), (854, 480), (838, 400)])
 def test_controls_fit_and_keyboard_focus(widget, qapp, mode, window_size):
     widget.resize(*window_size)
     show_mode(widget, mode, qapp)
+    assert (widget.width(), widget.height()) == window_size
     buttons = ((widget.btn_save, widget.btn_p_capture) if mode == PREVIEW_MODE else
                (widget.btn_trigger, widget.btn_open_dir, widget.btn_open_last, widget.btn_c_preview))
     for button in buttons:
@@ -224,14 +246,16 @@ def test_action_button_palette_and_states(widget, qapp):
         (widget.btn_trigger, "#FF963F", "#FFA65E"),
         (widget.btn_c_preview, "#D9DDE0", "#ECEFF1"),
     ):
-        QTest.mouseMove(widget, widget.rect().topLeft())
         qapp.sendEvent(button, QEvent(QEvent.Type.Leave))
         button.clearFocus()
         qapp.processEvents()
         assert background(button) == normal
-        QTest.mouseMove(button, button.rect().center())
         center = QPointF(button.rect().center())
-        qapp.sendEvent(button, QEnterEvent(center, center, QPointF(button.mapToGlobal(button.rect().center()))))
+        global_center = QPointF(button.mapToGlobal(button.rect().center()))
+        qapp.sendEvent(button, QEnterEvent(center, center, global_center))
+        qapp.sendEvent(button, QMouseEvent(QEvent.Type.MouseMove, center, global_center,
+                                          Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                                          Qt.KeyboardModifier.NoModifier))
         qapp.processEvents()
         assert background(button) == hover
         button.setFocus(Qt.FocusReason.TabFocusReason)
@@ -242,7 +266,6 @@ def test_action_button_palette_and_states(widget, qapp):
         assert background(button) == "#343739"
         button.setEnabled(True)
     show_mode(widget, PREVIEW_MODE, qapp)
-    QTest.mouseMove(widget, widget.rect().topLeft())
     qapp.sendEvent(widget.btn_p_capture, QEvent(QEvent.Type.Leave))
     widget.btn_p_capture.clearFocus()
     qapp.processEvents()
