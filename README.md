@@ -1,7 +1,7 @@
 # arducam_photo
 
 Lightweight, importable one-shot photo capture for the Arducam B0494C (108 MP UVC), Windows 11 x64.
-No GUI, database, server, preview, persistent profiles or installer.
+The repository has three layers: the **library** (`arducam_photo`), the **CLI examples** (`examples/`) and the **graphical app** (`arducam_photo.app`, PySide6). No Streamlit, browser, server, SQLite or installer.
 
 ## API
 
@@ -69,4 +69,27 @@ Close any camera app first; use `--overwrite` to replace existing files.
 | Tested on hardware | **nothing yet** (no camera in Codespace) |
 | To verify on hardware | direct native capture without preview, 12000×9000 content, focus/colour vs. demo, successive captures, camera freed, 720p, import from a second program |
 
-The milestone is **not** validated by simulated tests alone. Later (not here): separate Preview/Settings and Capture modes; a capture never restarts the preview.
+The milestone is **not** validated by simulated tests alone.
+
+## Graphical application (PySide6)
+
+Install and run (Windows, no PowerShell activation required for the `.cmd`):
+
+```
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[gui]"
+.venv\Scripts\python.exe -m arducam_photo.app        # single documented command
+run_arducam_capture.cmd                                 # double-click launcher
+```
+
+Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), choose `arducam_108mp.json`, open **Preview / Réglages**, set the focus (0–1023, numeric + slider; no autofocus), **Enregistrer les réglages**, go to **Capture**, press the trigger. PNGs go to `Pictures\ArducamCapture` (real, possibly OneDrive-redirected folder; changeable). Unique file names; nothing is overwritten, moved or deleted.
+
+**Modes.** Start: nothing is opened. Preview: 1280×720 at 30 fps (108 MP path, "if available") or 10 fps (720p), acquired and displayed FPS measured separately, manual focus with requested vs read-back value, unsaved-changes indicator and prompt (save / discard / stay). Capture: no video and no camera read while waiting; the saved profile is frozen at trigger time, the existing engine runs on the worker thread, the focus is reapplied each capture, the camera is released after (also on error), and the app stays in Capture (the preview never restarts by itself). A second trigger and mode changes are refused during a capture. Progress is shown by steps, without percentage.
+
+**Architecture.** Qt-free: `app/profile.py` (profile + injectable `ProfileStore`, JSON in `%LOCALAPPDATA%\ArducamCapture`), `app/paths.py`, `app/preview.py` (preview adapter), `app/controller.py` (single worker owning every camera operation; one latest frame, one outstanding notification), `app/model.py` (mode orchestration). Qt: `app/widget.py` (reusable `CameraWidget`, host passes its own `SessionModel`/stores) and `app/main.py`. Frames are deep-copied into `QImage` so Qt never references freed numpy buffers. The profile holds camera id (index only: flagged fragile), path, API, requested focus and read-back; not the RAW transport nor the preview mode. A missing/invalid CCM file refuses the native capture; the correction is never silently disabled. Corrupt JSON files are kept (renamed `.corrupt-*`), never deleted.
+
+**Limits.** OpenCV open/set/read/release are native and non-interruptible: no effective timeout or cancellation is promised; closing the window waits (up to 10 s) for the worker and cannot abort a blocked call. The 14.2 s of the first test is neither a guarantee nor an end-to-end UI measure. The "last photo" shown is from the current session only. USB speed is never measured. Do not mix OpenCV distributions.
+
+**Tests run (Linux sandbox, simulated camera, `python -m pytest`, offscreen Qt):** engine/storage regressions, preview/capture transitions, no reads while waiting in Capture, no automatic preview, profile save/reload, unsaved-change decisions, saved focus passed to the engine, frozen profile, mutual exclusion, error/camera release, double trigger, clean shutdown, QImage buffer lifetime. The Windows CI workflow runs the same suite; no Windows run was done here.
+
+**Hardware validation still to do:** 30-minute preview; visual focus tuning; profile persistence after relaunch; 20 consecutive captures; dimensions, sharpness, colours; UI responsiveness, memory, latency; disconnect/reconnect; close without leaving the camera busy. The app is **not** validated on hardware.
