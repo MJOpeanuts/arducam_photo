@@ -199,7 +199,8 @@ def test_unexpected_error_also_returns_to_idle(env):
     assert env.model.controller.state == "idle"
 
 
-def test_missing_ccm_not_silently_disabled(tmp_path):
+def test_missing_ccm_not_silently_disabled(tmp_path, monkeypatch):
+    _fake_resources(monkeypatch, tmp_path, None)
     e = Env(tmp_path)  # no ccm configured
     try:
         e.preview(); e.set_focus_and_save()
@@ -342,6 +343,30 @@ def test_engine_independent_of_qt():
 
 
 # ---- bundled default tuning file ----
+def test_real_bundled_used_without_settings_and_from_other_cwd(tmp_path, monkeypatch):
+    from pathlib import Path
+    from arducam_photo.bundled_ccm import bundled_ccm_exists
+    from arducam_photo.ccm import load_ccm_file
+
+    monkeypatch.chdir(tmp_path)
+    assert bundled_ccm_exists()
+    e = Env(tmp_path)
+    try:
+        assert not e.model.settings.ccm_path
+        path = e.model.effective_ccm_path()
+        assert Path(path).name == "arducam_108mp.json"
+        assert load_ccm_file(path)
+        assert "ressource intégrée" in e.model.ccm_status()
+        e.preview(); e.set_focus_and_save()
+        to_capture(e)
+        e.model.trigger()
+        e.wait("capture_done"); e.wait("capture_idle")
+        assert e.captures[0].ccm_path == path
+        assert e.captures[0].apply_ccm
+    finally:
+        e.close()
+
+
 def _fake_resources(monkeypatch, tmp_path, content):
     import arducam_photo.bundled_ccm as b
     d = tmp_path / "res"

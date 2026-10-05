@@ -6,5 +6,6 @@ build/
 dist/
 *.png
 *.jpg
-# Manufacturer tuning file: redistribution rights unverified, never commit.
+# Ignore tuning files except the bundled package resource.
 arducam_108mp.json
+!/src/arducam_photo/resources/arducam_108mp.json
