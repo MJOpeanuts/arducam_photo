@@ -33,7 +33,9 @@ Blocking native calls (no interruptible timeout): `VideoCapture` open, `set`, `r
 ## CCM tuning file (`arducam_108mp.json`)
 
 - In the Codespace it was **not found** by a filesystem search of the sandbox, and nothing is tracked by Git (`git ls-files` shows no JSON). It is in `.gitignore`. A Windows clone will not have it.
-- Get it from the manufacturer repo (branch `Arducam108MPDemo`, commit `b6c599c80648041a0413df751d96f3eeb5f03270`) or copy your existing one to e.g. `C:\arducam\arducam_108mp.json` and pass it via `ccm_path` / `--ccm`. It is not bundled: redistribution rights are unverified.
+- Get it from the manufacturer repo (branch `Arducam108MPDemo`, commit `b6c599c80648041a0413df751d96f3eeb5f03270`) or copy your existing one to e.g. `C:\arducam\arducam_108mp.json` and pass it via `ccm_path` / `--ccm`. It is **not currently bundled**: the file is absent from this repository and its redistribution rights could not be verified, so `.gitignore` still excludes it.
+
+**Default in the GUI**: the app uses the package resource `src/arducam_photo/resources/arducam_108mp.json` (loaded via `importlib.resources`, independent of the current directory; included in wheels through `pyproject.toml`). No file selection is required at first launch. Choosing another file ("Avancé : utiliser un autre arducam_108mp.json…") is an optional override and takes priority over the resource. If the resource is missing or invalid, the 108 MP capture is refused with a precise error; the correction is never silently disabled. Typical flow once the resource is committed: `git pull`, `pip install .[gui]`, `arducam-capture`.
 - Validated: JSON object with non-empty `ccms`, each entry `ct` (positive, strictly increasing) and `ccm` (9 finite numbers). Missing/invalid file → `CaptureConfigError` before the camera is opened. `info.ccm_applied` records whether correction ran.
 
 ## References and licence

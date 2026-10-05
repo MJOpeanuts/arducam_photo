@@ -64,7 +64,7 @@ class CameraWidget(QWidget):
         self.cam_note = QLabel("Identification par index OpenCV : fragile (peut changer entre deux essais).")
         self.cam_note.setWordWrap(True)
         self.ccm_label = QLabel(); self.ccm_label.setWordWrap(True)
-        ccm_btn = QPushButton("Choisir arducam_108mp.json…"); ccm_btn.clicked.connect(self._pick_ccm)
+        ccm_btn = QPushButton("Avancé : utiliser un autre arducam_108mp.json…"); ccm_btn.clicked.connect(self._pick_ccm)
         self.folder_label = QLabel(); self.folder_label.setWordWrap(True)
         folder_btn = QPushButton("Dossier des photos…"); folder_btn.clicked.connect(self._pick_folder)
         self.btn_to_preview = QPushButton("Preview / Réglages")

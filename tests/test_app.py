@@ -339,3 +339,54 @@ def test_engine_independent_of_qt():
     code = ("import sys, arducam_photo, arducam_photo.app, arducam_photo.app.model;"
             "assert not any(m.startswith('PySide6') for m in sys.modules)")
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+# ---- bundled default tuning file ----
+def _fake_resources(monkeypatch, tmp_path, content):
+    import arducam_photo.bundled_ccm as b
+    d = tmp_path / "res"
+    d.mkdir()
+    if content is not None:
+        (d / b.RESOURCE_NAME).write_text(content, encoding="utf-8")
+    monkeypatch.setattr(b.resources, "files", lambda pkg: d)
+    return d
+
+
+def test_bundled_used_without_settings_and_from_other_cwd(tmp_path, monkeypatch, ccm_file):
+    import shutil
+    d = _fake_resources(monkeypatch, tmp_path, None)
+    shutil.copy(ccm_file, d / "arducam_108mp.json")
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    e = Env(tmp_path)
+    try:
+        assert not e.model.settings.ccm_path
+        assert e.model.effective_ccm_path() == str(d / "arducam_108mp.json")
+        assert "ressource intégrée" in e.model.ccm_status()
+    finally:
+        e.model.shutdown(5)
+
+
+def test_explicit_override_wins_over_bundled(tmp_path, monkeypatch, ccm_file):
+    _fake_resources(monkeypatch, tmp_path, "{}")
+    e = Env(tmp_path, ccm_file)
+    try:
+        assert e.model.effective_ccm_path() == ccm_file
+    finally:
+        e.model.shutdown(5)
+
+
+def test_bundled_missing_or_invalid_reports_error(tmp_path, monkeypatch):
+    from arducam_photo.errors import CaptureConfigError
+    d = _fake_resources(monkeypatch, tmp_path, None)
+    e = Env(tmp_path)
+    try:
+        with pytest.raises(CaptureConfigError):
+            e.model.effective_ccm_path()
+        assert "ERREUR" in e.model.ccm_status()
+        (d / "arducam_108mp.json").write_text("not json")
+        e.model._bundled = None
+        assert "ERREUR" in e.model.ccm_status()
+    finally:
+        e.model.shutdown(5)
