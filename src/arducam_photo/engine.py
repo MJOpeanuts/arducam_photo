@@ -1,0 +1,201 @@
+"""One-shot capture. Blocking; run it outside a UI thread.
+
+Blocking native calls (not interruptible, no timeout promised): VideoCapture
+open, cap.set and cap.read. Cancellation is checked only between them.
+COM: OpenCV's MSMF backend initialises COM itself in the calling thread; this
+module does not touch COM, so open/read/release all happen in the caller thread.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import threading
+import time
+from typing import Callable, Optional
+
+import numpy as np
+
+from .ccm import load_ccm_file
+from .config import AcquisitionInfo, CaptureConfig, CaptureResult, SettingReport, NATIVE_108MP
+from .errors import (
+    CameraOpenError, CameraReadError, CameraSetupError, CaptureBusyError,
+    CaptureCancelled, RawBufferError,
+)
+from .isp import process_raw
+
+log = logging.getLogger("arducam_photo")
+log.addHandler(logging.NullHandler())
+
+TRANSPORT_W, TRANSPORT_H = 6000, 9000
+RAW_ROWS, RAW_COLS = 9000, 12000
+RAW_BYTES = RAW_ROWS * RAW_COLS  # 108_000_000
+P720_W, P720_H, P720_FPS = 1280, 720, 10
+
+_busy = threading.Lock()
+
+
+def _open_video_capture(index: int, api: str):
+    """Default opener; cv2 is imported lazily so importing the package is inert."""
+    import cv2
+
+    api_id = {"msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW, "any": cv2.CAP_ANY}[api]
+    return cv2.VideoCapture(index, api_id)
+
+
+def _import_cv2():
+    import cv2
+
+    return cv2
+
+
+def _check_cancel(ev: Optional[threading.Event]) -> None:
+    if ev is not None and ev.is_set():
+        raise CaptureCancelled("capture cancelled")
+
+
+def validate_raw_buffer(frame) -> np.ndarray:
+    """Return the flat-compatible uint8 buffer or raise RawBufferError. Never reshapes."""
+    if not isinstance(frame, np.ndarray):
+        raise RawBufferError(f"RAW buffer is {type(frame).__name__}, expected numpy.ndarray")
+    if frame.dtype != np.uint8:
+        raise RawBufferError(f"RAW buffer dtype is {frame.dtype}, expected uint8")
+    if frame.size != RAW_BYTES or frame.nbytes != RAW_BYTES:
+        raise RawBufferError(
+            f"RAW buffer has {frame.size} elements / {frame.nbytes} bytes (shape {frame.shape}); "
+            f"expected {RAW_BYTES}. The camera is probably not in the 6000x9000 USB 3 mode."
+        )
+    return frame
+
+
+def validate_720p_frame(frame) -> np.ndarray:
+    if not isinstance(frame, np.ndarray):
+        raise RawBufferError(f"frame is {type(frame).__name__}, expected numpy.ndarray")
+    if frame.dtype != np.uint8 or frame.shape != (P720_H, P720_W, 3):
+        raise RawBufferError(
+            f"720p frame is dtype {frame.dtype} shape {frame.shape}; expected uint8 ({P720_H}, {P720_W}, 3) BGR"
+        )
+    return frame
+
+
+def capture(
+    config: CaptureConfig,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    _opener: Optional[Callable] = None,
+) -> CaptureResult:
+    """Take one photo. Raises a CaptureError subclass on failure; always releases the camera."""
+    cfg = dataclasses.replace(config)  # frozen copy for this acquisition
+    cfg.validate()
+    if not _busy.acquire(blocking=False):
+        raise CaptureBusyError("another capture is already running")
+    try:
+        return _run(cfg, cancel_event, _opener or _open_video_capture)
+    finally:
+        _busy.release()
+
+
+def _run(cfg, cancel, opener) -> CaptureResult:
+    t0 = time.monotonic()
+    native = cfg.path == NATIVE_108MP
+    ccms = None
+    ccm_requested = native and cfg.apply_ccm
+    if ccm_requested:
+        ccms = load_ccm_file(cfg.ccm_path)  # fail before touching the camera
+    _check_cancel(cancel)
+
+    log.info("open api=%s index=%d path=%s", cfg.api, cfg.camera_index, cfg.path)
+    cap = opener(cfg.camera_index, cfg.api)
+    try:
+        if cap is None or not cap.isOpened():
+            raise CameraOpenError(
+                f"cannot open camera index {cfg.camera_index} with api {cfg.api}; "
+                "check the index, that no other program holds the camera, and the USB link"
+            )
+        cv2 = _import_cv2()
+        settings = {}
+
+        def setp(name, prop, value, required=False):
+            try:
+                ok = bool(cap.set(prop, value))
+                rb = cap.get(prop)
+            except Exception as e:
+                raise CameraSetupError(f"setting {name} failed: {e}") from e
+            settings[name] = SettingReport(value, ok, rb)
+            log.info("set %s=%s accepted=%s readback=%s", name, value, ok, rb)
+            if required and not ok:
+                raise CameraSetupError(f"driver rejected required setting {name}={value}")
+            _check_cancel(cancel)
+
+        if native:
+            transport = (TRANSPORT_W, TRANSPORT_H)
+            setp("width", cv2.CAP_PROP_FRAME_WIDTH, TRANSPORT_W, True)
+            setp("height", cv2.CAP_PROP_FRAME_HEIGHT, TRANSPORT_H, True)
+            setp("convert_rgb", cv2.CAP_PROP_CONVERT_RGB, 0, True)
+        else:
+            transport = (P720_W, P720_H)
+            setp("width", cv2.CAP_PROP_FRAME_WIDTH, P720_W, True)
+            setp("height", cv2.CAP_PROP_FRAME_HEIGHT, P720_H, True)
+            setp("fps", cv2.CAP_PROP_FPS, P720_FPS)
+        if cfg.focus is not None:
+            setp("focus", cv2.CAP_PROP_FOCUS, cfg.focus)
+
+        validate = validate_raw_buffer if native else validate_720p_frame
+        frame, frames_read, failed, invalid = _stabilize(cap, cfg, validate, cancel)
+
+        _check_cancel(cancel)
+        if native:
+            raw = frame.reshape(RAW_ROWS, RAW_COLS)  # view; buffer already validated
+            image = process_raw(raw, ccms)
+        else:
+            image = frame.copy()  # own the memory beyond the driver's buffer lifetime
+        del frame
+        h, w = image.shape[:2]
+        info = AcquisitionInfo(
+            config=cfg, api=cfg.api, camera_index=cfg.camera_index, path=cfg.path,
+            transport_size=transport, settings=settings, frames_read=frames_read,
+            failed_reads=failed, invalid_buffers=invalid, ccm_requested=ccm_requested,
+            ccm_applied=ccms is not None, ccm_path=cfg.ccm_path if ccm_requested else None,
+            duration_s=time.monotonic() - t0,
+        )
+        log.info("done %dx%d reads=%d failed=%d invalid=%d ccm=%s %.2fs",
+                 w, h, frames_read, failed, invalid, info.ccm_applied, info.duration_s)
+        return CaptureResult(image=image, width=w, height=h, info=info)
+    finally:
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            log.exception("release failed")
+
+
+def _stabilize(cap, cfg, validate, cancel):
+    """Read until stabilization_reads + 1 valid frames; the last valid frame is kept.
+
+    Failed reads and invalid buffers are counted separately and bounded.
+    Transient bad frames are tolerated up to the bounds.
+    """
+    needed = cfg.stabilization_reads + 1
+    good = failed = invalid = 0
+    frame = None
+    while good < needed:
+        _check_cancel(cancel)
+        try:
+            ok, data = cap.read()
+        except Exception as e:
+            raise CameraReadError(f"read raised: {e}") from e
+        if not ok:
+            failed += 1
+            if failed > cfg.max_failed_reads:
+                raise CameraReadError(f"{failed} failed reads (limit {cfg.max_failed_reads})")
+            continue
+        try:
+            frame = validate(data)
+        except RawBufferError as e:
+            invalid += 1
+            log.warning("invalid buffer %d/%d: %s", invalid, cfg.max_invalid_buffers, e)
+            if invalid > cfg.max_invalid_buffers:
+                raise RawBufferError(f"{invalid} invalid buffers (limit {cfg.max_invalid_buffers}); last: {e}") from e
+            continue
+        good += 1
+    return frame, good + failed + invalid, failed, invalid

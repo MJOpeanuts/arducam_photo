@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+*.png
+*.jpg
+# Manufacturer tuning file: redistribution rights unverified, never commit.
+arducam_108mp.json
