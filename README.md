@@ -84,7 +84,7 @@ py -3.12 -m venv .venv
 run_arducam_capture.cmd                                 # double-click launcher
 ```
 
-Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), leave the bundled CCM selected by default, open **Preview / Réglages**, set the focus (0–1023, numeric + slider; no autofocus), **Enregistrer les réglages**, go to **Capture**, press the trigger. PNGs go to `Pictures\ArducamCapture` (real, possibly OneDrive-redirected folder; changeable). Unique file names; nothing is overwritten, moved or deleted.
+Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), leave the bundled CCM selected by default, open **Preview / Réglages**, set the focus (0–1023, numeric + slider; no autofocus or calibrated distance), **Enregistrer**, go to **Capture**, press **PHOTO**. PNGs go to `Pictures\ArducamCapture` (real, possibly OneDrive-redirected folder; changeable). Unique file names; nothing is overwritten, moved or deleted.
 
 **Modes.** Start: nothing is opened. Preview: 1280×720 at 30 fps (108 MP path, "if available") or 10 fps (720p), acquired and displayed FPS measured separately, manual focus with requested vs read-back value, unsaved-changes indicator and prompt (save / discard / stay). Capture: no video and no camera read while waiting; the saved profile is frozen at trigger time, the existing engine runs on the worker thread, the focus is reapplied each capture, the camera is released after (also on error), and the app stays in Capture (the preview never restarts by itself). A second trigger and mode changes are refused during a capture. Progress is shown by steps, without percentage.
 
@@ -95,3 +95,21 @@ Quick trial on your PC: close other camera apps, start the app, choose *Photo 10
 **Tests run (Linux sandbox, simulated camera, `python -m pytest`, offscreen Qt):** engine/storage regressions, preview/capture transitions, no reads while waiting in Capture, no automatic preview, profile save/reload, unsaved-change decisions, saved focus passed to the engine, frozen profile, mutual exclusion, error/camera release, double trigger, clean shutdown, QImage buffer lifetime. The Windows CI workflow runs the same suite; no Windows run was done here.
 
 **Hardware validation still to do:** 30-minute preview; visual focus tuning; profile persistence after relaunch; 20 consecutive captures; dimensions, sharpness, colours; UI responsiveness, memory, latency; disconnect/reconnect; close without leaving the camera busy. The app is **not** validated on hardware.
+
+### Présentation Preview / Capture
+
+- Interface anthracite, Segoe UI, image dominante sur fond sombre, sans étirement ni recadrage. Redimensionner ne change ni la résolution ni la cadence caméra. **Plein écran** agrandit seulement le flux ; **Échap** revient aux réglages.
+- Sous le preview : focus manuel, **Enregistrer**, un seul statut de sauvegarde et **Capture** (gris clair, changement de mode uniquement). Sous la dernière photo : **PHOTO** (orange), deux boutons d’ouverture de style identique, **Preview** (gris clair).
+- **Diagnostic**, fermé initialement, regroupe FPS, consigne/lecture de focus et limites de vérification, backend, chemins, correction couleur, dimensions, durées et détails des erreurs. Une erreur bloquante garde un résumé visible hors Diagnostic.
+- Les SVG officiels `squirrel` et `refresh-cw` proviennent de [Lucide 0.468.0](https://github.com/lucide-icons/lucide/tree/0.468.0/icons). Ils sont embarqués dans le package avec leur [notice ISC](src/arducam_photo/resources/icons/LICENSE), sans accès réseau au lancement.
+
+Tests d’interface (Linux Qt offscreen ; aucune caméra nécessaire) :
+
+```sh
+PYTHONPATH=src QT_QPA_PLATFORM=offscreen python -m pytest
+PYTHONPATH=src QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.25 python -m pytest tests/test_widget.py
+PYTHONPATH=src QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python -m pytest tests/test_widget.py
+python -m pip wheel . --no-deps -w /tmp/arducam-wheel
+```
+
+Ces tests couvrent l’unicité du statut, le focus restauré, le redimensionnement sans nouvelle frame, les proportions, le plein écran/Échap, le Diagnostic, les ressources SVG, l’accessibilité des commandes à 1280 × 720, les états occupé/erreur et les boutons d’ouverture. Les facteurs Qt 100/125/150 % sous Linux ne remplacent **pas** une validation Windows : vérifier encore Segoe UI, survol/focus/désactivation, plein écran et absence de texte coupé sur un écran Windows 1280 × 720 à chaque mise à l’échelle, ainsi que tous les essais matériels ci-dessus.

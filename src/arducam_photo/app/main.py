@@ -19,7 +19,7 @@ def main(argv=None) -> int:
     widget = CameraWidget(model)
     win.setCentralWidget(widget)
     win.closeEvent = lambda e: (e.ignore() if not widget.can_close() else (widget.shutdown(), e.accept()))
-    win.resize(900, 800)
+    win.resize(1280, 720)
     win.show()
     return app.exec()
 
