@@ -90,7 +90,7 @@ Quick trial on your PC: close other camera apps, start the app, choose *Photo 10
 
 **Architecture.** Qt-free: `app/profile.py` (profile + injectable `ProfileStore`, JSON in `%LOCALAPPDATA%\ArducamCapture`), `app/paths.py`, `app/preview.py` (preview adapter), `app/controller.py` (single worker owning every camera operation; one latest frame, one outstanding notification), `app/model.py` (mode orchestration). Qt: `app/widget.py` (reusable `CameraWidget`, host passes its own `SessionModel`/stores) and `app/main.py`. Frames are deep-copied into `QImage` so Qt never references freed numpy buffers. The profile holds camera id (index only: flagged fragile), path, API, requested focus and read-back; not the RAW transport nor the preview mode. A missing/invalid CCM file refuses the native capture; the correction is never silently disabled. Corrupt JSON files are kept (renamed `.corrupt-*`), never deleted.
 
-**Limits.** OpenCV open/set/read/release are native and non-interruptible: no effective timeout or cancellation is promised; closing the window waits (up to 10 s) for the worker and cannot abort a blocked call. The 14.2 s of the first test is neither a guarantee nor an end-to-end UI measure. The "last photo" shown is from the current session only. USB speed is never measured. Do not mix OpenCV distributions.
+**Limits.** OpenCV open/set/read/release are native and non-interruptible: no effective timeout or cancellation is promised; closing the window waits (up to 10 s) for the worker and cannot abort a blocked call. If that shutdown wait expires, controls are disabled; a nonblocking Qt timer checks worker completion and the application exits automatically after the worker finishes and releases the camera. A permanently blocked native call can still prevent exit. The 14.2 s of the first test is neither a guarantee nor an end-to-end UI measure. The "last photo" shown is from the current session only. USB speed is never measured. Do not mix OpenCV distributions.
 
 **Tests run (Linux sandbox, simulated camera, `python -m pytest`, offscreen Qt):** engine/storage regressions, preview/capture transitions, no reads while waiting in Capture, no automatic preview, profile save/reload, unsaved-change decisions, saved focus passed to the engine, frozen profile, mutual exclusion, error/camera release, double trigger, clean shutdown, QImage buffer lifetime. The Windows CI workflow runs the same suite; no Windows run was done here.
 
@@ -98,9 +98,10 @@ Quick trial on your PC: close other camera apps, start the app, choose *Photo 10
 
 ### Présentation Preview / Capture
 
-- Interface anthracite, Segoe UI, image dominante sur fond sombre, sans étirement ni recadrage. Redimensionner ne change ni la résolution ni la cadence caméra. **Plein écran** agrandit seulement le flux ; **Échap** revient aux réglages.
+- Interface anthracite, Segoe UI, image dominante sur fond sombre, sans étirement ni recadrage. Redimensionner ne change ni la résolution ni la cadence caméra. Le plein écran concerne toute la fenêtre `QMainWindow`, pas un dialogue de preview : **F11** bascule dans tous les modes, **Échap** quitte le plein écran, en restaurant la fenêtre normale (géométrie comprise) ou maximisée précédente. Les commandes restent accessibles.
+- L'icône originale **Nuts** (`nuts-app.svg`, `.png`, `.ico`) identifie l'application et l'exécutable ; elle n'est pas remplacée par l'écureuil Lucide. L'en-tête reste minimal, avec un petit écureuil. Le pied de page affiche l'image originale `powered by_white.png`, sans réseau.
 - Sous le preview : focus manuel, **Enregistrer**, un seul statut de sauvegarde et **Capture** (gris clair, changement de mode uniquement). Sous la dernière photo : **PHOTO** (orange), deux boutons d’ouverture de style identique, **Preview** (gris clair).
-- **Diagnostic**, fermé initialement, regroupe FPS, consigne/lecture de focus et limites de vérification, backend, chemins, correction couleur, dimensions, durées et détails des erreurs. Une erreur bloquante garde un résumé visible hors Diagnostic.
+- **Diagnostic**, fermé initialement, regroupe FPS, consigne/lecture de focus et limites de vérification, backend, chemins, correction couleur, dimensions, durées et détails des erreurs, ainsi que **Plein écran**, **Démarrer en plein écran** et **Quitter**. Le démarrage en plein écran est une préférence persistante, désactivée par défaut ; basculer avec F11 ne change pas cette préférence. Quitter utilise la même fermeture contrôlée que la fenêtre. Une erreur bloquante garde un résumé visible hors Diagnostic.
 - Les SVG officiels `squirrel` et `refresh-cw` proviennent de [Lucide 0.468.0](https://github.com/lucide-icons/lucide/tree/0.468.0/icons). Ils sont embarqués dans le package avec leur [notice ISC](src/arducam_photo/resources/icons/LICENSE), sans accès réseau au lancement.
 
 Tests d’interface (Linux Qt offscreen ; aucune caméra nécessaire) :
@@ -109,14 +110,20 @@ Tests d’interface (Linux Qt offscreen ; aucune caméra nécessaire) :
 PYTHONPATH=src QT_QPA_PLATFORM=offscreen python -m pytest
 PYTHONPATH=src QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.25 python -m pytest tests/test_widget.py
 PYTHONPATH=src QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python -m pytest tests/test_widget.py
-python -m pip wheel . --no-deps -w /tmp/arducam-wheel
+python -m pip wheel . --no-deps -w dist/wheels
 ```
 
-Exécuté pour cette refonte : **76 tests réussis** pour la suite complète à 100 %, **23 tests d’interface réussis** à chacun des facteurs 125 % et 150 %, construction du wheel et chargement des SVG depuis un package installé hors du dépôt.
+Validation de cette mise à jour sous Linux Qt offscreen à 100 % : **108 tests réussis**, en exécutions séparées (**68 tests hors interface**, dont les 15 tests de packaging, et **40 tests GUI**). Les **40 tests GUI ont aussi réussi à chacun des facteurs Qt 125 % et 150 %**. Aucun résultat Windows ni validation d'un véritable exécutable Windows n'est revendiqué.
 
-Ces tests couvrent l’unicité du statut (y compris un échec de sauvegarde), le focus restauré, le redimensionnement sans nouvelle frame, les proportions, le plein écran/Échap, le Diagnostic, les ressources SVG, les états normal/survol/focus/désactivé, les boutons d’ouverture et les transitions du contrôleur. Les commandes restent accessibles dans les zones logiques 1280 × 720, 1024 × 576, 854 × 480 et 838 × 400 (marge pour la barre des tâches et les décorations), sans agrandissement forcé de la fenêtre, même Diagnostic ouvert.
+Ces tests couvrent l’unicité du statut (y compris un échec de sauvegarde), le focus restauré, le redimensionnement sans nouvelle frame, les proportions, le Diagnostic, les ressources SVG, les états normal/survol/focus/désactivé, les boutons d’ouverture et les transitions du contrôleur. Les nouveaux cas vérifient le démarrage en plein écran désactivé par défaut puis activé après relance ; F11/Échap dans les deux modes, avec restauration normale/maximisée puis démaximisation ; l'absence de changement des opérations caméra du véritable contrôleur avec caméra simulée ; les noms exacts des ressources manquantes et les octets/pixels originaux ; le pied de page dans les limites de la fenêtre ; les protections de fermeture, y compris un délai de shutdown dépassé. Les commandes restent accessibles dans les zones logiques 1280 × 720, 1024 × 576, 854 × 480 et 838 × 400 (marge pour la barre des tâches et les décorations), sans agrandissement forcé de la fenêtre, même Diagnostic ouvert.
 
-Les facteurs Qt 100/125/150 % sous Linux ne remplacent **pas** une validation Windows : vérifier encore Segoe UI, survol/focus/désactivation, plein écran et absence de texte coupé sur un écran Windows 1280 × 720 à chaque mise à l’échelle, ainsi que tous les essais matériels ci-dessus.
+Les facteurs Qt sous Linux ne remplacent **pas** une validation Windows : reconstruire puis vérifier l'exécutable, l'icône de fenêtre/barre des tâches, Segoe UI, survol/focus/désactivation, plein écran et absence de texte coupé sur un écran Windows 1280 × 720 à chaque mise à l'échelle réelle 100/125/150 %, ainsi que tous les essais matériels ci-dessus. Ces validations Windows et caméra physique restent à faire.
+
+Tests de packaging exécutés pour cette mise à jour sous Linux : **15 réussis**
+(`PYTHONPATH=src python -m pytest tests/test_packaging.py -q`).
+Ils construisent un wheel, vérifient les octets des originaux, les chargent hors
+du dépôt et vérifient la spécification (onedir, sans console, ICO, hooks Qt,
+noms précis des fichiers manquants). Ils ne lancent pas PyInstaller sur Windows.
 
 Captures du **rendu réel Qt**, à 1280 × 720, issues du test de transitions avec caméra simulée (frames noires), et non de maquettes. L’heure affichée vient du fichier produit par le test ; aucune image de démonstration n’est chargée par l’application.
 
@@ -126,33 +133,80 @@ Captures du **rendu réel Qt**, à 1280 × 720, issues du test de transitions av
 
 ### Build Windows autonome (PyInstaller, onedir)
 
-Construire **sur Windows x64**, avec Python 3.12 ; PyInstaller ne compile pas
-un exécutable Windows depuis Linux. Depuis la racine du dépôt, dans PowerShell :
+Construire **sur Windows x64**, avec **Python 3.12 x64** ; PyInstaller ne compile
+pas un exécutable Windows depuis Linux. Les commandes suivantes nécessitent
+Internet sur le PC de construction. Depuis la racine du dépôt, dans PowerShell :
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install ".[gui]" pyinstaller==6.22.3
-.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm arducamcapture.spec
-.\dist\ArducamCapture\ArducamCapture.exe
+py -3.12 -c "import struct; assert struct.calcsize('P') * 8 == 64, 'Python x64 requis'"
+py -3.12 -m venv .venv-build
+.\.venv-build\Scripts\python.exe -m pip install ".[gui]" pyinstaller==6.22.3
+.\.venv-build\Scripts\python.exe -m pip freeze --all > build-environment.txt
+.\.venv-build\Scripts\python.exe -m PyInstaller --clean --noconfirm arducamcapture.spec
+& ".\dist\ArducamCapture\ArducamCapture.exe"
 ```
+
+Pour lancer **depuis les sources** (Python nécessaire), utiliser les commandes
+de la section « Graphical application » ou, après cette installation :
+`.\.venv-build\Scripts\python.exe -m arducam_photo.app`.
+Après toute modification des sources, des ressources ou de la spécification,
+**reconstruire l'exécutable** avec la commande PyInstaller ci-dessus ; un ancien
+`.exe` ne lit pas les nouveaux fichiers du dépôt.
+
+Les dépendances GUI ont des bornes minimales, pas un verrouillage complet :
+conserver `build-environment.txt`, le commit (`git rev-parse HEAD`), la version
+exacte de Python (`.\.venv-build\Scripts\python.exe --version`) et la version de
+Windows avec le livrable. Pour reproduire les versions dans un environnement
+neuf Python 3.12 x64, installer ce fichier avec
+`python -m pip install -r build-environment.txt`, puis le même commit avec
+`python -m pip install --no-deps --no-build-isolation ".[gui]"` avant PyInstaller. La ligne locale
+`arducam-photo @ file:///...` produite par `pip freeze` peut pointer vers le
+dépôt du premier PC : la retirer de la copie utilisée pour la réinstallation,
+puis installer le commit local comme indiqué. Ce gel reproduit les versions,
+il ne garantit pas des exécutables identiques octet pour octet.
 
 La spécification remplace `ArducamCapture.spec`. Elle produit un dossier
 `dist\ArducamCapture`, **pas** un exécutable onefile : distribuer le dossier
 entier, y compris `_internal`. Le lanceur appelle le même point d'entrée GUI ;
 aucun changement du moteur caméra, des profils ou du dossier des photos.
-Les hooks PyInstaller embarquent NumPy, OpenCV, PySide6 et les plugins Qt.
+L'exécutable est sans console (`console=False`). Les hooks PyInstaller
+embarquent NumPy, OpenCV et PySide6 ; la spécification demande explicitement
+QtCore, QtGui, QtWidgets et QtSvg pour activer les hooks nécessaires, notamment
+le rendu SVG, les plugins d'images et le plugin de plateforme Windows.
 Toutes les ressources du package sont incluses à leur emplacement relatif :
 JSON couleur, SVG, icônes PNG/ICO, notice des icônes et image de marque.
 Le JSON par défaut reste chargé via `importlib.resources`, indépendamment du
 répertoire de lancement ; l'ICO sert aussi d'icône de l'exécutable Windows.
+Si un original manque, la construction s'arrête en indiquant son chemin exact,
+y compris `icons/nuts-app.svg`, `icons/nuts-app.png`, `icons/nuts-app.ico` ou
+`src/arducam_photo/resources/powered by_white.png` (espace conservé).
 
 Le workflow **Windows onedir package** construit sur Windows, vérifie la
 présence des ressources et publie le dossier complet comme artifact
 `ArducamCapture-windows-x64-onedir` (conservé 7 jours).
-Ni `.venv`, ni `build`, ni `dist`, ni les photos utilisateur ne sont à
-versionner ; les exclusions existantes de `.gitignore` sont conservées.
+Ni `.venv`, ni `.venv-build`, ni `build`, ni `dist`, ni `build-environment.txt`,
+ni les photos utilisateur ne sont à versionner. `.venv-build` et le gel sont
+des fichiers locaux de construction ; ne pas les ajouter au dépôt.
 
-Avant distribution : extraire l'artifact entier sur un PC Windows sans Python,
-lancer depuis un autre répertoire, vérifier les icônes et le JSON par défaut,
+**Utilisation portable hors ligne sous Windows 11 x64, sans Python :** copier
+ou extraire le dossier complet `ArducamCapture` sur le PC cible ; double-cliquer
+`ArducamCapture.exe`, ou lancer dans PowerShell :
+
+```powershell
+& "C:\Applications\ArducamCapture\ArducamCapture.exe"
+```
+
+Aucune installation de Python, pip ou connexion Internet n'est nécessaire
+pour ce dossier construit ; ne pas copier seulement le `.exe`, ne pas supprimer
+`_internal`, ne pas utiliser le lanceur source `.cmd`. Le pilote UVC et le
+matériel caméra doivent toujours être disponibles sur le PC.
+
+Avant distribution : extraire l'artifact entier sur un PC Windows 11 x64 sans Python,
+déconnecté du réseau, lancer depuis un autre répertoire, vérifier l'icône Nuts,
+le pied de page et le JSON par défaut ; vérifier F11/Échap depuis fenêtre normale
+et maximisée, le démarrage en plein écran persistant et Quitter,
 puis tester preview, focus, captures 108 MP/720p, sauvegarde, relance et libération
-de la caméra avec le matériel réel. Un build réussi ne valide pas ces essais.
+de la caméra avec le matériel réel. Les tests de packaging Linux vérifient les
+ressources originales du wheel et les options de la spécification ; ils ne
+construisent ni ne valident un exécutable Windows. Un build réussi et des tests
+Qt offscreen ne valident pas ces essais physiques Windows.

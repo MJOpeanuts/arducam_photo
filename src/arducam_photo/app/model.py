@@ -69,6 +69,9 @@ class SessionModel:
         self._update_settings(ccm_path=path)
         self.controller.verify_ccm(path)
 
+    def set_start_fullscreen(self, enabled: bool) -> None:
+        self._update_settings(start_fullscreen=bool(enabled))
+
     def effective_ccm_path(self) -> str:
         """Explicit user choice wins; otherwise the bundled resource (CaptureConfigError if absent)."""
         if self.settings.ccm_path:

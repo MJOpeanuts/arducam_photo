@@ -164,6 +164,7 @@ class AppSettings:
     ccm_path: Optional[str] = None
     camera_index: int = 0
     path: str = NATIVE_108MP
+    start_fullscreen: bool = False
 
 
 class JsonSettingsStore:
