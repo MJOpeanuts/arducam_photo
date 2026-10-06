@@ -19,7 +19,8 @@ from arducam_photo.app.model import SessionModel
 from arducam_photo.app.profile import JsonProfileStore, JsonSettingsStore
 from arducam_photo.app.profile import ShootingProfile
 from arducam_photo.app.model import PREVIEW_MODE, CAPTURE_MODE
-from arducam_photo.app.icons import lucide_icon
+from arducam_photo.app.icons import application_icon, bundled_pixmap, lucide_icon
+from arducam_photo.app.window import MainWindow
 
 
 @pytest.fixture(scope="module")
@@ -136,19 +137,187 @@ def test_image_rescales_without_new_frame(widget, qapp, mode, image_name):
     assert label.pixmap().width() > second.width()
 
 
-def test_fullscreen_escape(widget, qapp):
+@pytest.fixture
+def window(qapp, tmp_path):
+    model = SessionModel(JsonProfileStore(str(tmp_path / "profiles.json")),
+                         JsonSettingsStore(str(tmp_path / "settings.json")))
+    model.saved = ShootingProfile(camera_key=model.camera.key, focus_requested=300)
+    model.draft = model.saved
+    win = MainWindow(model)
+    win.resize(1280, 720)
+    win.move(40, 50)
+    win.show()
+    win.activateWindow()
+    QTest.qWait(20)
+    yield win
+    win.leave_fullscreen()
+    model.mode = CAPTURE_MODE
+    model.controller._state = "idle"
+    win.close()
+    qapp.processEvents()
+
+
+@pytest.mark.parametrize("mode", [PREVIEW_MODE, CAPTURE_MODE])
+@pytest.mark.parametrize("maximized", [False, True])
+@pytest.mark.parametrize("exit_key", [Qt.Key.Key_Escape, Qt.Key.Key_F11])
+def test_global_fullscreen_restores_window(window, qapp, mode, maximized, exit_key):
+    widget = window.widget
+    show_mode(widget, mode, qapp)
+    if maximized:
+        window.showMaximized()
+    qapp.processEvents()
+    geometry, state = window.geometry(), window.windowState()
+    normal = window.normalGeometry()
+    controller = widget.model.controller
+    before = (controller.state, widget.model.mode, widget.model.draft, widget.model.saved)
+    top_levels = set(qapp.topLevelWidgets())
+    focus = widget.focus_spin if mode == PREVIEW_MODE else widget.btn_trigger
+    focus.setFocus()
+    QTest.keyClick(focus, Qt.Key.Key_F11)
+    qapp.processEvents()
+    assert window.isFullScreen()
+    assert set(qapp.topLevelWidgets()) == top_levels
+    assert widget.footer.isVisible()
+    assert widget.rect().contains(widget.footer.geometry())
+    assert all(b.text() == "Quitter le plein écran" for b in widget._fullscreen_controls)
+    assert (widget.btn_save if mode == PREVIEW_MODE else widget.btn_trigger).isVisible()
+    QTest.keyClick(focus, exit_key)
+    qapp.processEvents()
+    assert not window.isFullScreen()
+    assert window.windowState() == state
+    assert window.geometry() == geometry
+    if maximized:
+        window.showNormal()
+        qapp.processEvents()
+        assert window.geometry() == normal
+    else:
+        assert window.normalGeometry() == normal
+    assert (controller.state, widget.model.mode, widget.model.draft, widget.model.saved) == before
+    assert all(b.text() == "Plein écran" for b in widget._fullscreen_controls)
+
+
+def test_diagnostic_fullscreen_and_persistent_preference(window, qapp):
+    widget = window.widget
     show_mode(widget, PREVIEW_MODE, qapp)
-    widget.model.controller._latest = np.zeros((180, 320, 3), np.uint8)
-    widget._on_event("frame", {})
-    button = next(b for b in widget.findChildren(QPushButton) if b.text() == "Plein écran")
-    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-    qapp.processEvents()
-    fullscreen = next(w for w in qapp.topLevelWidgets() if w.isFullScreen())
-    QTest.keyClick(fullscreen, Qt.Key.Key_Escape)
-    qapp.processEvents()
-    assert not any(w.isFullScreen() for w in qapp.topLevelWidgets())
-    assert widget.video.isVisible()
-    assert widget.model.mode == PREVIEW_MODE
+    widget.preview_diagnostic_toggle.setChecked(True)
+    widget._fullscreen_controls[0].click()
+    assert window.isFullScreen()
+    widget._startup_controls[0].setChecked(True)
+    assert all(c.isChecked() for c in widget._startup_controls)
+    settings = JsonSettingsStore(widget.model.settings_store.path)
+    assert settings.load().start_fullscreen
+    fresh = SessionModel(widget.model.profiles, settings)
+    try:
+        assert fresh.settings.start_fullscreen
+        assert fresh.settings.camera_index == widget.model.settings.camera_index
+        assert fresh.settings.photo_dir == widget.model.settings.photo_dir
+    finally:
+        fresh.shutdown()
+    widget._startup_controls[1].setChecked(False)
+    assert not settings.load().start_fullscreen
+
+
+def test_quit_uses_existing_guards(window, qapp, monkeypatch):
+    widget = window.widget
+    show_mode(widget, PREVIEW_MODE, qapp)
+    widget.model.draft = dataclasses.replace(widget.model.saved, focus_requested=301)
+    monkeypatch.setattr(widget, "_ask_unsaved", lambda: "stay")
+    quit_button = next(b for b in widget.preview_diagnostic.findChildren(QPushButton)
+                       if b.text() == "Quitter l’application")
+    quit_button.click()
+    assert window.isVisible()
+    monkeypatch.setattr(widget, "_info", lambda text: None)
+    widget.model.controller._state = "capturing"
+    quit_button.click()
+    assert window.isVisible()
+    widget.model.controller._state = "preview"
+    monkeypatch.setattr(widget, "_ask_unsaved", lambda: "save")
+    shutdown = widget.shutdown
+    monkeypatch.setattr(widget, "shutdown", lambda: False)
+    quit_button.click()
+    assert window.isVisible()
+    assert not widget.model.has_unsaved()
+    monkeypatch.setattr(widget, "shutdown", shutdown)
+    quit_button.click()
+    assert not window.isVisible()
+
+
+def test_original_app_icon_footer_and_clean_header(widget, qapp, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    icon = application_icon()
+    assert not icon.isNull()
+    original = bundled_pixmap("icons/nuts-app.png").toImage()
+    assert original.pixelColor(0, 0).alpha() == 0
+    logo = bundled_pixmap("powered by_white.png")
+    for mode in (PREVIEW_MODE, CAPTURE_MODE):
+        show_mode(widget, mode, qapp)
+        assert widget.footer.source.toImage() == logo.toImage()
+        displayed = widget.footer.pixmap()
+        assert abs(displayed.width() / displayed.height() - logo.width() / logo.height()) < .1
+        assert widget.footer.isVisible()
+        assert widget.rect().contains(widget.footer.geometry())
+        assert not (widget.preview_diagnostic if mode == PREVIEW_MODE else widget.capture_diagnostic).isVisible()
+        labels = [label.text() for label in widget.findChildren(QLabel) if label.isVisible()]
+        assert "Preview / Réglages" not in labels and "Profil enregistré" not in labels
+        assert not widget.profile_label.isVisible()
+        assert not hasattr(widget, "fullscreen_video")
+
+
+@pytest.mark.parametrize("missing", ["icons/nuts-app.svg", "icons/nuts-app.png",
+                                   "icons/nuts-app.ico", "powered by_white.png"])
+def test_missing_original_resource_is_named(qapp, monkeypatch, tmp_path, missing):
+    import arducam_photo.app.icons as icons
+
+    root = resources.files("arducam_photo.resources")
+    for name in ("icons/nuts-app.svg", "icons/nuts-app.png", "icons/nuts-app.ico",
+                 "powered by_white.png"):
+        if name != missing:
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(root.joinpath(name).read_bytes())
+    monkeypatch.setattr(icons.resources, "files", lambda package: tmp_path)
+    with pytest.raises(FileNotFoundError, match=missing):
+        if missing.startswith("icons/"):
+            application_icon()
+        else:
+            bundled_pixmap(missing)
+
+
+def test_startup_default_and_fullscreen_after_relaunch(qapp, monkeypatch, tmp_path):
+    from PySide6 import QtWidgets
+    from arducam_photo.app import main
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setattr(QtWidgets, "QApplication", lambda argv: qapp)
+    expected_fullscreen = False
+
+    def run():
+        qapp.processEvents()
+        win = next(w for w in qapp.topLevelWidgets()
+                   if isinstance(w, MainWindow) and w.isVisible())
+        assert win.isFullScreen() == expected_fullscreen
+        assert not qapp.windowIcon().isNull() and not win.windowIcon().isNull()
+        assert win.widget.model.controller.state == "idle"
+        win.widget._startup_controls[0].setChecked(True)
+        win.close()
+        return 0
+
+    monkeypatch.setattr(qapp, "exec", run)
+    assert main.main([]) == 0
+    expected_fullscreen = True
+    assert main.main([]) == 0
+
+
+def test_windows_app_id_is_stable(monkeypatch):
+    import ctypes
+    from arducam_photo.app import main
+
+    calls = []
+    monkeypatch.setattr(main.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(shell32=SimpleNamespace(
+        SetCurrentProcessExplicitAppUserModelID=calls.append)), raising=False)
+    main.configure_windows_app_id()
+    assert calls == ["MJOpeanuts.ArducamCapture"]
 
 
 @pytest.mark.parametrize("mode", [PREVIEW_MODE, CAPTURE_MODE])
@@ -223,11 +392,14 @@ def test_controls_fit_and_keyboard_focus(widget, qapp, mode, window_size):
     assert abs(actual_height - expected_height) <= 2, f"Height mismatch: expected {expected_height}, got {actual_height}"
     buttons = ((widget.btn_save, widget.btn_p_capture) if mode == PREVIEW_MODE else
                (widget.btn_trigger, widget.btn_open_dir, widget.btn_open_last, widget.btn_c_preview))
+    assert widget.rect().contains(widget.footer.geometry())
+    footer_top = widget.footer.geometry().top()
     for button in buttons:
         position = button.mapTo(widget, button.rect().topLeft())
         assert position.x() >= 0 and position.y() >= 0
         assert position.x() + button.width() <= widget.width()
         assert position.y() + button.height() <= widget.height()
+        assert position.y() + button.height() < footer_top
         assert button.width() >= button.minimumSizeHint().width()
         if button.isEnabled():
             button.setFocus(Qt.FocusReason.TabFocusReason)
@@ -283,9 +455,10 @@ def test_widget_real_controller_transitions_and_capture(qapp, tmp_path):
 
     env = Env(tmp_path)
     env.model.set_photo_dir(str(tmp_path / "photos"))
-    w = CameraWidget(env.model)
-    w.resize(1280, 720)
-    w.show()
+    window = MainWindow(env.model)
+    w = window.widget
+    window.resize(1280, 720)
+    window.show()
 
     def wait_until(predicate):
         for _ in range(500):
@@ -309,11 +482,24 @@ def test_widget_real_controller_transitions_and_capture(qapp, tmp_path):
         wait_until(lambda: env.model.draft.focus_readback is not None)
         w._save()
         assert w.unsaved.text() == "Réglages enregistrés"
+        camera = VideoCap.registry[0]
+        window.toggle_fullscreen()
+        qapp.processEvents()
+        window.leave_fullscreen()
+        qapp.processEvents()
+        assert VideoCap.registry == [camera]
+        assert camera.released == 0
         screenshot("preview-flow")
         w._go_capture()
         wait_until(lambda: env.model.mode == CAPTURE_MODE and w.btn_trigger.isVisible())
         preview_reads = VideoCap.registry[0].reads
         assert VideoCap.registry[0].released == 1
+        window.toggle_fullscreen()
+        qapp.processEvents()
+        assert env.model.mode == CAPTURE_MODE
+        window.leave_fullscreen()
+        qapp.processEvents()
+        assert VideoCap.registry == [camera]
         env.gate.clear()
         w._trigger()
         assert not w.btn_trigger.isEnabled() and not w.btn_c_preview.isEnabled()
@@ -334,4 +520,4 @@ def test_widget_real_controller_transitions_and_capture(qapp, tmp_path):
         env.gate.set()
         assert w.shutdown()
         env.model.mode = CAPTURE_MODE
-        w.close()
+        window.close()

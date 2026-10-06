@@ -3,13 +3,35 @@ from pathlib import Path
 
 root = Path(SPECPATH)
 resources = root / "src" / "arducam_photo" / "resources"
+required_resources = (
+    "arducam_108mp.json",
+    "icons/nuts-app.svg",
+    "icons/nuts-app.png",
+    "icons/nuts-app.ico",
+    "icons/squirrel.svg",
+    "icons/refresh-cw.svg",
+    "icons/LICENSE",
+    "powered by_white.png",
+)
+missing = [name for name in required_resources if not (resources / name).is_file()]
+if missing:
+    raise FileNotFoundError(
+        "Missing required original package resources: "
+        + ", ".join(f"src/arducam_photo/resources/{name}" for name in missing)
+    )
 
 a = Analysis(
     [str(root / "packaging" / "launch_arducam.py")],
     pathex=[str(root / "src")],
     binaries=[],
     datas=[(str(resources), "arducam_photo/resources")],
-    hiddenimports=["arducam_photo.resources"],
+    hiddenimports=[
+        "arducam_photo.resources",
+        "PySide6.QtCore",
+        "PySide6.QtGui",
+        "PySide6.QtWidgets",
+        "PySide6.QtSvg",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

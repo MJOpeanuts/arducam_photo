@@ -10,13 +10,13 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
                                QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from ..config import COLOR_720P, NATIVE_108MP
 from .controller import ModeError
-from .icons import lucide_icon
+from .icons import bundled_pixmap, lucide_icon
 from .model import (CAPTURE_MODE, DISCARD, PATH_LABELS, PREVIEW_MODE, SAVE, START, STAY,
                     NeedsDecision, ProfileMissing, SessionModel)
 from .paths import open_in_system
@@ -65,6 +65,8 @@ class ImageView(QLabel):
 
 class CameraWidget(QWidget):
     _event = Signal(str, object)  # worker thread -> UI thread (queued)
+    fullscreen_requested = Signal()
+    quit_requested = Signal()
 
     def __init__(self, model: SessionModel, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -80,7 +82,8 @@ class CameraWidget(QWidget):
     # ---- layout ----
     def _build(self) -> None:
         self._technical = {"FPS acquis / affichés": "– / –"}
-        self._fullscreen = None
+        self._fullscreen_controls = []
+        self._startup_controls = []
         self.setStyleSheet("""
             QWidget { background: #1B1D1F; color: #F4F3F1; font-family: "Segoe UI";
                       font-size: 13px; }
@@ -156,17 +159,10 @@ class CameraWidget(QWidget):
         # preview page
         p = QWidget(); pl = QVBoxLayout(p)
         self.btn_p_capture = self._mode_button("Capture", self._go_capture)
-        self._header(pl, "Preview / Réglages")
+        self._header(pl)
         self.video = ImageView("Aucun flux")
         self.video.setAccessibleName("Aperçu de la caméra")
         pl.addWidget(self.video, 1)
-        self.btn_fullscreen = QPushButton("Plein écran")
-        self.btn_fullscreen.setToolTip("Afficher uniquement l’image · Échap pour revenir")
-        self.btn_fullscreen.setAccessibleName("Aperçu en plein écran")
-        self.btn_fullscreen.clicked.connect(self._show_fullscreen)
-        self.btn_fullscreen.setEnabled(False)
-        full_row = QHBoxLayout(); full_row.addStretch(); full_row.addWidget(self.btn_fullscreen)
-        pl.addLayout(full_row)
         self.fps_label = QLabel("FPS acquis : – | affichés : –")
         self.focus_slider = QSlider(Qt.Orientation.Horizontal); self.focus_slider.setRange(FOCUS_MIN, FOCUS_MAX)
         self.focus_spin = QSpinBox(); self.focus_spin.setRange(FOCUS_MIN, FOCUS_MAX)
@@ -196,10 +192,9 @@ class CameraWidget(QWidget):
         # capture page
         c = QWidget(); cl = QVBoxLayout(c)
         self.btn_c_preview = self._mode_button("Preview", self._go_preview)
-        self._header(cl, "Profil enregistré")
+        self._header(cl)
         self.profile_label = QLabel(); self.profile_label.setWordWrap(True)
         self.profile_label.setObjectName("muted")
-        cl.addWidget(self.profile_label)
         self.ccm_label2 = QLabel(); self.ccm_label2.setWordWrap(True)
         self.btn_trigger = QPushButton("PHOTO"); self.btn_trigger.setObjectName("photo")
         self.btn_trigger.setIcon(lucide_icon("squirrel", "#21180E", 24))
@@ -229,10 +224,18 @@ class CameraWidget(QWidget):
         cl.addLayout(action_row); cl.addWidget(self.result_label)
         self.result_label.hide(); self.step_label.hide()
         self.capture_details = QLabel(); self.capture_details.setWordWrap(True)
-        self._diagnostic(cl, "capture", (self.ccm_label2, self.capture_details))
+        self._diagnostic(cl, "capture", (self.profile_label, self.ccm_label2, self.capture_details))
         for page in (self.start_scroll, p, c):
             self.stack.addWidget(page)
-        lay = QVBoxLayout(self); lay.setContentsMargins(16, 12, 16, 12); lay.addWidget(self.stack)
+        lay = QVBoxLayout(self); lay.setContentsMargins(16, 12, 16, 12); lay.addWidget(self.stack, 1)
+        self.footer = ImageView()
+        self.footer.setObjectName("footer")
+        self.footer.setAccessibleName("powered by")
+        self.footer.setMinimumSize(0, 0)
+        self.footer.setFixedHeight(28)
+        self.footer.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.footer.setPixmap(bundled_pixmap("powered by_white.png"))
+        lay.addWidget(self.footer)
 
     def _mode_button(self, text, callback):
         button = QPushButton(text)
@@ -244,14 +247,12 @@ class CameraWidget(QWidget):
         button.clicked.connect(callback)
         return button
 
-    def _header(self, layout, title):
+    def _header(self, layout):
         row = QHBoxLayout()
         icon = QLabel()
         icon.setPixmap(lucide_icon("squirrel", "#FF963F", 30).pixmap(QSize(30, 30)))
         icon.setAccessibleName("Arducam")
         row.addWidget(icon); row.addStretch()
-        label = QLabel(title); label.setObjectName("title")
-        row.addWidget(label)
         layout.addLayout(row)
 
     def _diagnostic(self, layout, name, widgets):
@@ -267,6 +268,19 @@ class CameraWidget(QWidget):
         for widget in widgets:
             widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             inner.addWidget(widget)
+        fullscreen = QPushButton("Plein écran")
+        fullscreen.setToolTip("Toute la fenêtre · F11 pour basculer · Échap pour revenir")
+        fullscreen.clicked.connect(self.fullscreen_requested.emit)
+        startup = QCheckBox("Démarrer en plein écran")
+        startup.setChecked(self.model.settings.start_fullscreen)
+        startup.toggled.connect(self._set_start_fullscreen)
+        quit_button = QPushButton("Quitter l’application")
+        quit_button.clicked.connect(self.quit_requested.emit)
+        self._fullscreen_controls.append(fullscreen)
+        self._startup_controls.append(startup)
+        inner.addWidget(fullscreen)
+        inner.addWidget(startup)
+        inner.addWidget(quit_button)
         inner.addStretch(); area.setWidget(content); area.hide()
         toggle.toggled.connect(area.setVisible)
         toggle.toggled.connect(lambda checked: toggle.setArrowType(
@@ -275,29 +289,16 @@ class CameraWidget(QWidget):
         setattr(self, f"{name}_diagnostic_toggle", toggle)
         setattr(self, f"{name}_diagnostic", area)
 
-    def _show_fullscreen(self):
-        if self.video.source.isNull():
-            return
-        if self._fullscreen is not None:
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Preview · Échap pour revenir")
-        dialog.setStyleSheet("background: #111314;")
-        layout = QVBoxLayout(dialog); layout.setContentsMargins(0, 0, 0, 0)
-        self.fullscreen_video = ImageView("Aucun flux")
-        if not self.video.source.isNull():
-            self.fullscreen_video.setPixmap(self.video.source)
-        layout.addWidget(self.fullscreen_video)
-        self._fullscreen = dialog
-        dialog.finished.connect(self._fullscreen_closed)
-        dialog.showFullScreen()
+    def set_fullscreen_state(self, enabled):
+        for button in self._fullscreen_controls:
+            button.setText("Quitter le plein écran" if enabled else "Plein écran")
 
-    def _fullscreen_closed(self, _):
-        dialog = self._fullscreen
-        self._fullscreen = None
-        if dialog is not None:
-            dialog.setWindowState(Qt.WindowState.WindowNoState)
-            dialog.deleteLater()
+    def _set_start_fullscreen(self, enabled):
+        self._guard(self.model.set_start_fullscreen, enabled)
+        for checkbox in self._startup_controls:
+            checkbox.blockSignals(True)
+            checkbox.setChecked(self.model.settings.start_fullscreen)
+            checkbox.blockSignals(False)
 
     def _refresh_diagnostic(self):
         prof = self.model.draft if self.model.mode == PREVIEW_MODE else self.model.saved
@@ -360,8 +361,6 @@ class CameraWidget(QWidget):
                 self.result_label.hide()
             self._set_capture_busy(self.model.controller.state == "capturing")
             self._fps_timer.stop()
-            if self._fullscreen is not None:
-                self._fullscreen.reject()
         elif mode == PREVIEW_MODE:
             self.preview_msg.clear(); self.preview_msg.hide()
             self._fps_timer.start()
@@ -507,14 +506,8 @@ class CameraWidget(QWidget):
                 if self._technical.get("Dimensions du preview") != dimensions:
                     self._technical["Dimensions du preview"] = dimensions
                     self._refresh_diagnostic()
-                self.btn_fullscreen.setEnabled(True)
-                if self._fullscreen is not None:
-                    self.fullscreen_video.setPixmap(pixmap)
         elif event == "video_cleared":
             self.video.clear(); self.video.setText("Aucun flux")
-            self.btn_fullscreen.setEnabled(False)
-            if self._fullscreen is not None:
-                self._fullscreen.reject()
         elif event == "mode_changed":
             self._show_page(kw["mode"])
         elif event == "preview_failed":

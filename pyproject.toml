@@ -24,7 +24,14 @@ arducam-capture = "arducam_photo.app.main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"arducam_photo.resources" = ["arducam_108mp.json", "icons/*.svg", "icons/LICENSE"]
+"arducam_photo.resources" = [
+    "arducam_108mp.json",
+    "icons/*.svg",
+    "icons/*.png",
+    "icons/*.ico",
+    "icons/LICENSE",
+    "powered by_white.png",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
