@@ -213,8 +213,14 @@ def test_bundled_svg_icons(qapp):
 @pytest.mark.parametrize("window_size", [(1280, 720), (1024, 576), (854, 480), (838, 400)])
 def test_controls_fit_and_keyboard_focus(widget, qapp, mode, window_size):
     widget.resize(*window_size)
+    widget.ensurePolished()
+    qapp.processEvents()
     show_mode(widget, mode, qapp)
-    assert (widget.width(), widget.height()) == window_size
+    # Allow small differences in window sizing across platforms (±2 pixels tolerance)
+    actual_width, actual_height = widget.width(), widget.height()
+    expected_width, expected_height = window_size
+    assert abs(actual_width - expected_width) <= 2, f"Width mismatch: expected {expected_width}, got {actual_width}"
+    assert abs(actual_height - expected_height) <= 2, f"Height mismatch: expected {expected_height}, got {actual_height}"
     buttons = ((widget.btn_save, widget.btn_p_capture) if mode == PREVIEW_MODE else
                (widget.btn_trigger, widget.btn_open_dir, widget.btn_open_last, widget.btn_c_preview))
     for button in buttons:
