@@ -232,14 +232,34 @@ def test_quit_uses_existing_guards(window, qapp, monkeypatch):
     assert window.isVisible()
     widget.model.controller._state = "preview"
     monkeypatch.setattr(widget, "_ask_unsaved", lambda: "save")
-    shutdown = widget.shutdown
-    monkeypatch.setattr(widget, "shutdown", lambda: False)
     quit_button.click()
-    assert window.isVisible()
     assert not widget.model.has_unsaved()
-    monkeypatch.setattr(widget, "shutdown", shutdown)
-    quit_button.click()
     assert not window.isVisible()
+
+
+def test_shutdown_timeout_disables_controls_then_closes(window, qapp, monkeypatch):
+    widget = window.widget
+    show_mode(widget, CAPTURE_MODE, qapp)
+    stopped = False
+    timeouts = []
+
+    def shutdown(timeout=None):
+        timeouts.append(timeout)
+        return stopped
+
+    monkeypatch.setattr(widget.model, "shutdown", shutdown)
+    window.close()
+    assert window.isVisible()
+    assert "Fermeture en cours" in window.statusBar().currentMessage()
+    assert not widget.isEnabled()
+    assert not widget.btn_trigger.isEnabled() and not widget.btn_c_preview.isEnabled()
+    window._poll_shutdown()
+    assert window.isVisible()
+    stopped = True
+    window._poll_shutdown()
+    assert not window.isVisible()
+    assert not window._shutdown_timer.isActive()
+    assert timeouts == [10, 0, 0]
 
 
 def test_original_app_icon_footer_and_clean_header(widget, qapp, monkeypatch, tmp_path):

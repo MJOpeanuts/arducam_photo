@@ -1,6 +1,6 @@
 """Main-window display state and guarded application exit."""
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QMainWindow
 
@@ -17,6 +17,10 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(application_icon())
         self._window_geometry = None
         self._window_state = Qt.WindowState.WindowNoState
+        self._closing = False
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.setInterval(1000)
+        self._shutdown_timer.timeout.connect(self._poll_shutdown)
         self.widget = CameraWidget(model)
         self.setCentralWidget(self.widget)
         self.widget.fullscreen_requested.connect(self.toggle_fullscreen)
@@ -46,11 +50,27 @@ class MainWindow(QMainWindow):
         self.fullscreen_changed.emit(False)
 
     def closeEvent(self, event):
+        if self._closing:
+            if self._shutdown_timer.isActive():
+                event.ignore()
+            else:
+                event.accept()
+            return
         if not self.widget.can_close():
             event.ignore()
             return
         if not self.widget.shutdown():
-            self.widget._info("La caméra n'a pas répondu dans les 10 s ; attendez avant de quitter.")
+            self._closing = True
+            self.widget.setEnabled(False)
+            self.statusBar().showMessage(
+                "La caméra n'a pas répondu dans les 10 s. Fermeture en cours : "
+                "l’application quittera automatiquement après sa libération.")
+            self._shutdown_timer.start()
             event.ignore()
             return
         event.accept()
+
+    def _poll_shutdown(self):
+        if self.widget.model.shutdown(timeout=0):
+            self._shutdown_timer.stop()
+            self.close()
