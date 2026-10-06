@@ -123,3 +123,36 @@ Captures du **rendu réel Qt**, à 1280 × 720, issues du test de transitions av
 | Preview / Réglages | Capture après enregistrement |
 | --- | --- |
 | ![Preview rendu par Qt](docs/screenshots/preview.png) | ![Capture rendu par Qt](docs/screenshots/capture.png) |
+
+### Build Windows autonome (PyInstaller, onedir)
+
+Construire **sur Windows x64**, avec Python 3.12 ; PyInstaller ne compile pas
+un exécutable Windows depuis Linux. Depuis la racine du dépôt, dans PowerShell :
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install ".[gui]" pyinstaller==6.22.3
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm arducamcapture.spec
+.\dist\ArducamCapture\ArducamCapture.exe
+```
+
+La spécification remplace `ArducamCapture.spec`. Elle produit un dossier
+`dist\ArducamCapture`, **pas** un exécutable onefile : distribuer le dossier
+entier, y compris `_internal`. Le lanceur appelle le même point d'entrée GUI ;
+aucun changement du moteur caméra, des profils ou du dossier des photos.
+Les hooks PyInstaller embarquent NumPy, OpenCV, PySide6 et les plugins Qt.
+Toutes les ressources du package sont incluses à leur emplacement relatif :
+JSON couleur, SVG, icônes PNG/ICO, notice des icônes et image de marque.
+Le JSON par défaut reste chargé via `importlib.resources`, indépendamment du
+répertoire de lancement ; l'ICO sert aussi d'icône de l'exécutable Windows.
+
+Le workflow **Windows onedir package** construit sur Windows, vérifie la
+présence des ressources et publie le dossier complet comme artifact
+`ArducamCapture-windows-x64-onedir` (conservé 7 jours).
+Ni `.venv`, ni `build`, ni `dist`, ni les photos utilisateur ne sont à
+versionner ; les exclusions existantes de `.gitignore` sont conservées.
+
+Avant distribution : extraire l'artifact entier sur un PC Windows sans Python,
+lancer depuis un autre répertoire, vérifier les icônes et le JSON par défaut,
+puis tester preview, focus, captures 108 MP/720p, sauvegarde, relance et libération
+de la caméra avec le matériel réel. Un build réussi ne valide pas ces essais.

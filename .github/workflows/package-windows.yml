@@ -1,0 +1,56 @@
+name: Windows onedir package
+
+on:
+  push:
+    paths:
+      - "arducamcapture.spec"
+      - "packaging/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/package-windows.yml"
+  pull_request:
+    paths:
+      - "arducamcapture.spec"
+      - "packaging/**"
+      - "src/**"
+      - "pyproject.toml"
+      - ".github/workflows/package-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+      - run: python -m pip install ".[gui]" pyinstaller==6.22.3
+      - run: python -m PyInstaller --clean --noconfirm arducamcapture.spec
+      - name: Check bundled resources
+        shell: pwsh
+        run: |
+          $files = @(
+            "ArducamCapture.exe",
+            "_internal/arducam_photo/resources/arducam_108mp.json",
+            "_internal/arducam_photo/resources/icons/squirrel.svg",
+            "_internal/arducam_photo/resources/icons/refresh-cw.svg",
+            "_internal/arducam_photo/resources/icons/nuts-app.ico",
+            "_internal/arducam_photo/resources/icons/LICENSE",
+            "_internal/arducam_photo/resources/powered by_white.png"
+          )
+          foreach ($file in $files) {
+            if (-not (Test-Path "dist/ArducamCapture/$file" -PathType Leaf)) {
+              throw "Missing bundled file: $file"
+            }
+          }
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: ArducamCapture-windows-x64-onedir
+          path: dist/ArducamCapture/
+          if-no-files-found: error
+          retention-days: 7
