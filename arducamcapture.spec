@@ -1,21 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+from pathlib import Path
 
-datas = []
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('arducam_photo')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('cv2')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-
+root = Path(SPECPATH)
+resources = root / "src" / "arducam_photo" / "resources"
 
 a = Analysis(
-    ['packaging/launch_arducam.py'],
-    pathex=['src'],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    [str(root / "packaging" / "launch_arducam.py")],
+    pathex=[str(root / "src")],
+    binaries=[],
+    datas=[(str(resources), "arducam_photo/resources")],
+    hiddenimports=["arducam_photo.resources"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -34,8 +28,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
+    icon=str(resources / "icons" / "nuts-app.ico"),
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
@@ -47,7 +42,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='ArducamCapture',
 )
