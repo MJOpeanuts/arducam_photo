@@ -542,11 +542,12 @@ def test_public_timing_update_rejects_unlinked_output_atomically(tmp_path):
     assert Path(m).read_bytes() == before
 
 
-def test_final_archive_timing_failure_preserves_published_original(tmp_path, monkeypatch):
+@pytest.mark.parametrize("error_type", [OSError, MemoryError, RuntimeError])
+def test_final_archive_timing_failure_preserves_published_original(tmp_path, monkeypatch, error_type):
     writer = archive._atomic_json
     def fail_only_refinement(path, data, *, new=False):
         if not new:
-            raise OSError("disk full after successful publication")
+            raise error_type("timing refinement failed after successful publication")
         return writer(path, data, new=new)
     monkeypatch.setattr(archive, "_atomic_json", fail_only_refinement)
     a = acquisition(True)

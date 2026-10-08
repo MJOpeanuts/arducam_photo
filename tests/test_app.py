@@ -437,6 +437,7 @@ def test_capture_mode_mismatch_requires_explicit_preview_save(env):
     env.preview(); env.set_focus_and_save()
     to_capture(env)
     env.model.select_path(COLOR_4K)
+    assert "non applicable (4K couleur)" in env.model.ccm_status()
     with pytest.raises(ProfileMissing, match="mode différent"):
         env.model.trigger()
     env.model.enter_preview(); env.wait("mode_changed", nth=3)

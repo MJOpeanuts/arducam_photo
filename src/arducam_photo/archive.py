@@ -391,6 +391,7 @@ def archive_acquisition(acquisition, directory) -> str:
     except OSError as e:
         raise SaveError(f"cannot create acquisition directory: {e}") from e
     manifest = os.path.join(folder, "acquisition.json")
+    complete = False
     try:
         filename = "original.npy" if raw else "original.png"
         original_path = os.path.join(folder, filename)
@@ -449,19 +450,21 @@ def archive_acquisition(acquisition, directory) -> str:
         data["timings"]["total_until_archive_s"] = acquisition_duration + data["timings"]["archive_s"]
         _atomic_json(manifest, data, new=True)
         _read_manifest(manifest)
+        complete = True
         completed_archive_s = time.monotonic() - started
         def final_timings(metadata):
             metadata["timings"]["archive_s"] = completed_archive_s
             metadata["timings"]["total_until_archive_s"] = acquisition_duration + completed_archive_s
         try:
             _update_manifest(manifest, final_timings)
-        except (SaveError, OSError):
+        except Exception:
             # The complete archive is already published; optional timing refinement
             # must never delete a verified original if a later write cannot complete.
             pass
         return manifest
     except Exception as e:
-        shutil.rmtree(folder)
+        if not complete:
+            shutil.rmtree(folder)
         if isinstance(e, SaveError):
             raise
         raise SaveError(f"cannot archive acquisition: {e}") from e

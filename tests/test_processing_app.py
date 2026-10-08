@@ -309,6 +309,35 @@ def test_processing_to_capture_never_opens_preview(tmp_path):
         assert model.shutdown(5)
 
 
+def test_processing_to_preview_clears_full_result_before_camera_open(tmp_path):
+    from test_app import VideoCap
+    events = Events()
+    profiles = JsonProfileStore(str(tmp_path / "p.json"))
+    settings = JsonSettingsStore(str(tmp_path / "s.json"))
+    model = SessionModel(profiles, settings, events)
+
+    def opener(*args):
+        assert model.controller._processed is None
+        return VideoCap()
+
+    model.controller._opener = opener
+    source = str(tmp_path / "source.png")
+    assert cv2.imwrite(source, acquisition().original)
+    try:
+        model.request_processing_mode()
+        model.load_processing(source)
+        events.wait("processing_idle")
+        model.process(processing.ProcessingRecipe(apply_ccm=False))
+        events.wait("processing_idle", 2)
+        assert model.controller._processed is not None
+        model.enter_preview()
+        events.wait("processing_cleared")
+        events.wait("mode_changed", 2)
+        assert model.controller._processed is None
+    finally:
+        assert model.shutdown(5)
+
+
 def test_default_model_missing_bundled_ccm_still_acquires_and_archives(tmp_path, monkeypatch):
     events = Events()
     model = SessionModel(JsonProfileStore(str(tmp_path / "p.json")), JsonSettingsStore(str(tmp_path / "s.json")),

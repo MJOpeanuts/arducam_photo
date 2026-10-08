@@ -136,12 +136,13 @@ class SessionModel:
             fps=fps)
         self.pending = "preview"
         try:
+            if leaving_processing:
+                self.controller.clear_processed()
+                self._ui("processing_cleared")
             self.controller.open_preview(self.camera.index, self.api, self.path)
         except Exception:
             self.pending = None
             raise
-        if leaving_processing:
-            self._ui("processing_cleared")
 
     def request_capture_mode(self, decision: Optional[str] = None) -> bool:
         """Go to Capture. Returns False if the user stays in Preview. May raise NeedsDecision."""
@@ -204,8 +205,8 @@ class SessionModel:
         self.controller.capture(CaptureJob(cfg, self.photo_dir()))  # frozen copy; may raise busy
 
     def ccm_status(self) -> str:
-        if (self.saved.path if self.saved else self.path) != NATIVE_108MP:
-            return "Correction couleur : non applicable (mode couleur)"
+        if self.path != NATIVE_108MP:
+            return f"Correction couleur : non applicable ({PATH_LABELS.get(self.path, self.path)})"
         try:
             path = self.effective_ccm_path()
             load_ccm_file(path)

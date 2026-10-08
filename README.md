@@ -62,7 +62,8 @@ py -3.12 -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -e ".[test]"
 python -c "import cv2,numpy;print(cv2.__version__,numpy.__version__)"   # expect 5.0.0 / 2.5.3 (opencv-python 5.0.0.93)
 pip list | findstr /i opencv                                             # exactly one distribution
-$ccm = "C:\arducam\arducam_108mp.json"; Test-Path $ccm
+$ccm = (Resolve-Path ".\src\arducam_photo\resources\arducam_108mp.json").Path
+Test-Path $ccm   # or explicitly select your own tuning file
 python examples\capture_cli.py --path native_108mp --ccm $ccm --focus 187 -o $env:TEMP\n1.png -v
 python -c "import cv2;i=cv2.imread(r'$env:TEMP\n1.png');print(i.shape)"  # (9000, 12000, 3)
 ii $env:TEMP\n1.png

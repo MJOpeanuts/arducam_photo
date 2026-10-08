@@ -362,7 +362,9 @@ class CameraWidget(QWidget):
             box.setDetailedText(str(error)); box.exec()
 
     def _refresh_open_buttons(self):
-        self.btn_open_dir.setEnabled(os.path.isdir(self.model.photo_dir()))
+        directory = self._directory_to_open()
+        self.btn_open_dir.setEnabled(os.path.isdir(directory))
+        self.btn_open_dir.setToolTip(f"Ouvrir le dossier : {directory}")
         self.btn_open_last.setEnabled(bool(self.model.last_photo and os.path.isfile(self.model.last_photo)))
         self.btn_process_last.setEnabled(bool(self.model.last_acquisition)
                                          and self.model.controller.can_change_mode)
@@ -558,10 +560,17 @@ class CameraWidget(QWidget):
             self._refresh_open_buttons()
 
     def _open_dir(self):
-        d = self.model.photo_dir()
+        d = self._directory_to_open()
         if os.path.isdir(d):
             self._guard(open_in_system, d)
         self._refresh_open_buttons()
+
+    def _directory_to_open(self):
+        if self.model.last_acquisition:
+            directory = os.path.dirname(self.model.last_acquisition)
+            if os.path.isdir(directory):
+                return directory
+        return self.model.photo_dir()
 
     def _open_last(self):
         if self.model.last_photo and os.path.isfile(self.model.last_photo):

@@ -560,6 +560,32 @@ def test_capture_busy_failure_and_opening_availability(widget, qapp, tmp_path):
     assert widget.btn_open_dir.height() == widget.btn_open_last.height()
 
 
+def test_open_directory_prefers_last_archive_even_when_render_failed(widget, qapp, tmp_path, monkeypatch):
+    import arducam_photo.app.widget as module
+    root = tmp_path / "photos"
+    archive_dir = root / "acquisition-id"
+    archive_dir.mkdir(parents=True)
+    manifest = archive_dir / "acquisition.json"
+    manifest.write_text("{}")
+    previous = root / "previous.png"
+    previous.write_bytes(b"test")
+    widget.model.set_photo_dir(str(root))
+    widget.model.last_acquisition = str(manifest)
+    widget.model.last_photo = str(previous)
+    opened = []
+    monkeypatch.setattr(module, "open_in_system", opened.append)
+    show_mode(widget, CAPTURE_MODE, qapp)
+    fixed_height = widget.btn_open_dir.height()
+    widget._on_event("capture_failed", {"error": OSError("render failure"), "archive_path": str(manifest)})
+    widget.btn_open_dir.click()
+    widget.btn_open_last.click()
+    assert opened == [str(archive_dir), str(previous)]
+    assert widget.btn_open_dir.height() == widget.btn_open_last.height() == fixed_height
+    widget.model.last_acquisition = str(root / "missing" / "acquisition.json")
+    widget._open_dir()
+    assert opened[-1] == str(root)
+
+
 def test_bundled_svg_icons(qapp):
     for name in ("squirrel", "refresh-cw"):
         ref = resources.files("arducam_photo.resources").joinpath("icons", name + ".svg")
