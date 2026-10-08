@@ -47,6 +47,15 @@ def test_capture_and_save_writes_720p_png(tmp_path, monkeypatch):
     assert (r.width, r.height) == (1280, 720)
     assert (tmp_path / "x.png").exists()
     assert len(list(tmp_path.glob("*/acquisition.json"))) == 1
+    import json
+    manifest, = tmp_path.glob("*/acquisition.json")
+    metadata = json.loads(manifest.read_text())
+    assert len(metadata["outputs"]) == 1
+    assert metadata["outputs"][0]["acquisition_id"] == metadata["id"]
+    assert metadata["outputs"][0]["export_path"] == str(tmp_path / "x.png")
+    assert metadata["outputs"][0]["recipe"]["version"] == 1
+    assert metadata["outputs"][0]["timings"]["total_s"] > 0
+    assert "ccm" in metadata["outputs"][0]
 
 
 def test_grayscale_png_roundtrip(tmp_path):
@@ -97,3 +106,53 @@ def test_failed_verification_leaves_existing_image(tmp_path, monkeypatch):
         storage.save_png(img(), out, overwrite=True)
     assert out.read_bytes() == b"keep"
     assert [p.name for p in tmp_path.iterdir()] == ["a.png"]
+
+
+@pytest.mark.parametrize("stage", ["processing", "output"])
+def test_capture_failure_preserves_original_and_records_error(tmp_path, monkeypatch, stage):
+    from arducam_photo import engine, processing, storage, archive
+    frame = np.arange(720 * 1280 * 3, dtype=np.uint8).reshape(720, 1280, 3)
+    acquire = engine.acquire
+    monkeypatch.setattr(engine, "acquire", lambda cfg: acquire(
+        cfg, _opener=opener_for(FakeCap([(True, frame)]))))
+    def fail(*args, **kwargs):
+        raise ValueError("test failure")
+    monkeypatch.setattr(processing if stage == "processing" else storage,
+                        "process_image" if stage == "processing" else "save_image", fail)
+    with pytest.raises(ValueError, match="test failure") as raised:
+        ap.capture_and_save(ap.CaptureConfig(path="color_720p", stabilization_reads=0), tmp_path / "x.png")
+    manifest, = tmp_path.glob("*/acquisition.json")
+    assert raised.value.manifest_path == str(manifest)
+    assert raised.value.archive_path == str(manifest)
+    loaded = archive.load_acquisition(manifest)
+    assert np.array_equal(loaded.original, frame)
+    assert loaded.metadata["errors"][-1]["stage"] == stage
+    assert not (tmp_path / "x.png").exists()
+
+
+def test_pre_and_post_publication_verification(tmp_path, monkeypatch):
+    from arducam_photo import storage
+    calls = []
+    verify = storage._verify
+    def checked(path, image, **kwargs):
+        calls.append(path)
+        verify(path, image, **kwargs)
+    monkeypatch.setattr(storage, "_verify", checked)
+    timings = {}
+    out = tmp_path / "a.png"
+    storage.save_image(img(), out, _timings=timings)
+    assert len(calls) == 2
+    assert calls[-1] == str(out)
+    assert timings["verify_s"] == timings["pre_verify_s"] + timings["post_verify_s"]
+
+
+def test_archive_failure_has_no_recoverable_archive_attribute(tmp_path, monkeypatch):
+    from arducam_photo import archive, engine
+    monkeypatch.setattr(engine, "acquire", lambda cfg: object())
+    def fail(*args, **kwargs):
+        raise ap.SaveError("disk full")
+    monkeypatch.setattr(archive, "archive_acquisition", fail)
+    with pytest.raises(ap.SaveError, match="disk full") as raised:
+        ap.capture_and_save(ap.CaptureConfig(path="color_720p"), tmp_path / "out.png")
+    assert not hasattr(raised.value, "archive_path")
+    assert not hasattr(raised.value, "manifest_path")

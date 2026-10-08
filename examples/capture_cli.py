@@ -28,6 +28,8 @@ def main(argv=None) -> int:
         r = capture_and_save(cfg, a.output, overwrite=a.overwrite)
     except CaptureError as e:
         print(f"{type(e).__name__}: {e}", file=sys.stderr)
+        if getattr(e, "archive_path", None):
+            print(f"Original archivé : {e.archive_path}", file=sys.stderr)
         return 1
     print(f"saved {a.output}: {r.width}x{r.height} ccm_applied={r.info.ccm_applied} "
           f"duration={r.info.duration_s:.1f}s")

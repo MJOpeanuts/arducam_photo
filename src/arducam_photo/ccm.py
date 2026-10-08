@@ -34,25 +34,30 @@ def load_ccm_file(path) -> list:
     except (OSError, ValueError) as e:
         raise CaptureConfigError(f"CCM tuning file unreadable or not valid JSON: {p}: {e}") from e
     ccms = data.get("ccms") if isinstance(data, dict) else None
+    return validate_ccm_entries(ccms, source=f"CCM tuning file {p}")
+
+
+def validate_ccm_entries(ccms, *, source="CCM snapshot") -> list:
+    """Copy and normalize validated JSON-compatible tuning entries."""
     if not isinstance(ccms, list) or not ccms:
-        raise CaptureConfigError(f"CCM tuning file {p}: missing non-empty 'ccms' list")
+        raise CaptureConfigError(f"{source}: missing non-empty 'ccms' list")
     out = []
     last_ct = -math.inf
     for i, e in enumerate(ccms):
         if not isinstance(e, dict) or "ct" not in e or "ccm" not in e:
-            raise CaptureConfigError(f"CCM tuning file {p}: entry {i} needs 'ct' and 'ccm'")
+            raise CaptureConfigError(f"{source}: entry {i} needs 'ct' and 'ccm'")
         ct, m = e["ct"], e["ccm"]
         if isinstance(ct, bool) or not isinstance(ct, (int, float)) or not math.isfinite(ct) or ct <= 0:
-            raise CaptureConfigError(f"CCM tuning file {p}: entry {i} has invalid 'ct'")
+            raise CaptureConfigError(f"{source}: entry {i} has invalid 'ct'")
         if ct <= last_ct:
-            raise CaptureConfigError(f"CCM tuning file {p}: 'ct' values must be strictly increasing")
+            raise CaptureConfigError(f"{source}: 'ct' values must be strictly increasing")
         last_ct = ct
         try:
             arr = np.array(m, dtype=np.float64)
         except (TypeError, ValueError) as ex:
-            raise CaptureConfigError(f"CCM tuning file {p}: entry {i} 'ccm' not numeric") from ex
+            raise CaptureConfigError(f"{source}: entry {i} 'ccm' not numeric") from ex
         if arr.size != 9 or not np.all(np.isfinite(arr)):
-            raise CaptureConfigError(f"CCM tuning file {p}: entry {i} 'ccm' must hold 9 finite numbers")
+            raise CaptureConfigError(f"{source}: entry {i} 'ccm' must hold 9 finite numbers")
         out.append({"ct": float(ct), "ccm": arr.reshape(3, 3)})
     return out
 

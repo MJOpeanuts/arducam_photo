@@ -134,6 +134,7 @@ class CameraWidget(QWidget):
         self.cam_combo = QComboBox(); self._fill_cameras([self.model.camera.index])
         self.cam_combo.currentIndexChanged.connect(self._camera_changed)
         detect = QPushButton("Détecter les caméras (ouvre brièvement chaque index)")
+        self.detect_button = detect
         detect.clicked.connect(self._detect)
         self.usb_note = QLabel("Le parcours choisi n'est pas une mesure de la vitesse USB : "
                                "108 MP exige USB 3, 720p fonctionne en USB 2 ou 3 si le mode existe.")
@@ -254,6 +255,8 @@ class CameraWidget(QWidget):
         for label in ("Preview", "Capture", "Traitement"):
             self.tabs.addTab(label)
         self.tabs.currentChanged.connect(self._navigate)
+        self.tabs.tabBarClicked.connect(
+            lambda index: self._navigate(index) if self.model.mode == START and not self.model.pending else None)
         lay.addWidget(self.tabs); lay.addWidget(self.stack, 1)
         self.footer = ImageView()
         self.footer.setObjectName("footer")
@@ -291,6 +294,7 @@ class CameraWidget(QWidget):
         toggle.setAccessibleName("Afficher ou masquer le diagnostic")
         toggle.setToolTip("Informations techniques et détails des erreurs")
         area = QScrollArea(); area.setWidgetResizable(True); area.setMaximumHeight(150)
+        area.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
         content = QWidget(); inner = QVBoxLayout(content)
         for widget in widgets:
             widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -389,6 +393,12 @@ class CameraWidget(QWidget):
                     f"Focus {prof.focus_requested if prof.focus_requested is not None else '–'}")
             else:
                 self.profile_label.setText("Aucun profil valide : passez par Preview / Réglages.")
+            if prof and prof.path != self.model.path:
+                self.result_label.setText("Ce mode nécessite un nouveau profil enregistré explicitement en Preview.")
+                self.result_label.show()
+            elif self.result_label.text().startswith("Ce mode nécessite"):
+                self.result_label.clear()
+                self.result_label.hide()
             self._set_capture_busy(self.model.controller.state == "capturing")
             self._fps_timer.stop()
         elif mode == PREVIEW_MODE:
@@ -458,6 +468,7 @@ class CameraWidget(QWidget):
 
     def _detect(self):
         self._guard(self.model.controller.probe)
+        self._set_capture_busy(not self.model.controller.can_change_mode)
 
     def _pick_ccm(self):
         f, _ = QFileDialog.getOpenFileName(self, "arducam_108mp.json", "", "JSON (*.json)")
@@ -538,11 +549,12 @@ class CameraWidget(QWidget):
     def _set_capture_busy(self, busy: bool) -> None:
         for b in (self.btn_trigger, self.btn_c_preview, self.btn_p_capture,
                   self.btn_to_capture, self.btn_to_preview, self.capture_mode_combo, self.tabs,
-                  self.btn_process_last):
+                  self.btn_process_last, self.path_combo, self.cam_combo, self.detect_button):
             b.setEnabled(not busy)
         if not busy:
             prof = self.model.saved
-            self.btn_trigger.setEnabled(bool(prof and prof.is_valid and prof.path == self.model.path))
+            self.btn_trigger.setEnabled(bool(prof and prof.is_valid and prof.path == self.model.path)
+                                        and not self.model.controller.camera_fault)
             self._refresh_open_buttons()
 
     def _open_dir(self):
@@ -586,6 +598,10 @@ class CameraWidget(QWidget):
             self._refresh_preview_state(kw)
         elif event == "cameras":
             self._fill_cameras(kw["indices"] or [self.model.camera.index])
+            self._set_capture_busy(False)
+        elif event in ("cameras_failed", "preview_release_failed"):
+            self._set_capture_busy(False)
+            self._error("Caméra indisponible · voir Diagnostic.", kw["error"])
         elif event == "ccm_checked":
             if not kw["ok"]:
                 self._error("Fichier de correction couleur invalide.", kw["error"])
@@ -623,11 +639,13 @@ class CameraWidget(QWidget):
             self._refresh_diagnostic()
             self._refresh_open_buttons()
         elif event == "capture_failed":
+            self._technical["Chronométrage détaillé"] = str(kw.get("timings", {}))
             archive = kw.get("archive_path")
-            self._error("Échec du rendu · original archivé disponible en Traitement."
+            self._error("Capture incomplète · original archivé disponible en Traitement."
                         if archive else "Échec de la capture · aucun nouvel original archivé.", kw["error"])
         elif event == "capture_archived":
             self._technical["Archive de l’original"] = kw["path"]
+            self._technical["Chronométrage détaillé"] = str(kw.get("timings", {}))
             self._refresh_open_buttons()
         elif event.startswith("processing_"):
             self.processing.on_event(event, kw)
@@ -638,9 +656,6 @@ class CameraWidget(QWidget):
             elif event == "processing_idle":
                 self._set_capture_busy(False)
                 self._technical["Durée traitement"] = f"{kw['duration_s']:.2f} s"
-            elif event == "processing_cleared":
-                self.processing.has_result = False
-                self.processing.refresh()
         elif event == "capture_idle":
             self.step_label.setText("")
             self.step_label.hide()

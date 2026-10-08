@@ -20,7 +20,7 @@ save_png(result.image, r"C:\photos\a.png")   # optional helper
 - `capture(config, cancel_event=None)` → `CaptureResult(image, width, height, info)`. Errors, all `CaptureError` subclasses: `CaptureConfigError`, `CaptureBusyError`, `CaptureCancelled`, `CameraOpenError`, `CameraSetupError`, `CameraReadError`, `RawBufferError`, `IspError`, `SaveError`.
 - `save_png(image, path, overwrite=False)`: colour or grayscale uint8, temp file in the same directory, decode-back verification, never replaces an existing file unless `overwrite=True`.
 - `acquire(config)` returns owned original pixels and acquisition information, **after releasing the camera**, without ISP or storage. `capture()` remains a rendering facade, not an archival API; use `capture_and_save()` or the GUI for automatic original archival.
-- Import has no side effects. One capture at a time per process (`CaptureBusyError`). The camera is opened and released inside each call.
+- Import has no side effects. Camera acquisition is exclusive per process (`CaptureBusyError`); the GUI additionally serializes acquisition and processing jobs. The camera is opened and released inside each acquisition. Library callers should likewise serialize large rendering jobs to bound memory.
 
 ## Paths
 
@@ -79,8 +79,8 @@ Close any camera app first; use `--overwrite` to replace existing files.
 | | |
 |---|---|
 | Implemented | four modes, original archival, offline recipes, three-tab GUI, PNG/JPEG outputs, CLI + library example, Windows CI workflow |
-| Tested automatically (simulated camera, tiny Bayer images) | buffer validation, transient frames, bounds, open/read failure, no fallback, channel order, release on success/error, concurrency, import side effects, PNG round-trip, CCM errors, 720p isolation |
-| Measured (Linux sandbox, synthetic) | ISP at 9000×12000 incl. CCM: ~0.6 s, ~0.76 GB peak RSS; not representative of Windows |
+| Automated coverage (simulated camera, tiny Bayer images) | four modes and substitutions refused, buffer/read bounds, release-before-render, channel order/black/CCM, original round-trip and preservation after errors, PNG/JPEG, deterministic non-mutating recipes, invalid files/collisions/write failures, profile/tab and resource regressions |
+| Historical ISP measurement (base, Linux sandbox, synthetic) | 9000×12000 incl. CCM: ~0.6 s, ~0.76 GB peak RSS; not an end-to-end archival/processing benchmark or representative of Windows |
 | Tested on hardware | **nothing yet** (no camera in Codespace) |
 | To verify on hardware | direct native capture, 12000×9000 content, focus/colour vs. demo, successive captures, camera freed, all colour modes and actual framing, offline reprocessing, portable Windows |
 
@@ -110,6 +110,8 @@ The GUI and `capture_and_save()` follow this order: configure/acquire → valida
 The manifest records schema/id/timezone, software/library versions (commit when available), camera/API, requested settings and driver replies, transport/reconstructed shapes, dtype, Bayer/channel convention provenance, read counters, files/dimensions/weights/hashes, recipe parameters/version, errors and durations. Detailed timings separate open/configuration, stabilization/acquisition, release, archival, processing, encoding/writing/verification and total availability; Diagnostic shows these without an experiment dashboard.
 
 If rendering fails, an already verified original remains available for reprocessing and its error is recorded. If archival fails (including a full disk), the application does **not** claim the original was preserved. Incomplete or incompatible files are refused; failed saves do not replace an original. A verified data file without its completed manifest is not a successfully completed acquisition.
+
+No-overwrite publication requires filesystem hard-link support (for example NTFS); unsupported filesystems fail explicitly rather than risk replacing an original. A driver release exception is reported separately: validated pixels can still be archived, but further camera access is refused until application restart because exclusive ownership is no longer provable.
 
 1. In Capture, use the direct action to open the last acquisition in **Traitement**, or open an existing `acquisition.json` / original file there. Ordinary colour PNG/JPEG images can also be loaded.
 2. Disconnect the camera: all following steps work without it.
@@ -146,6 +148,17 @@ python -m pip wheel . --no-deps -w dist/wheels
 Validation historique de la base `833e50f` sous Linux Qt offscreen à 100 % : **108 tests réussis**, en exécutions séparées (**68 tests hors interface**, dont les 15 tests de packaging, et **40 tests GUI**). Les **40 tests GUI avaient aussi réussi aux facteurs Qt 125 % et 150 %**. Ces chiffres décrivent la base, pas une validation matérielle ni les nouveaux tests de cette PR. Aucun résultat Windows ni validation d'un véritable exécutable Windows n'est revendiqué.
 
 Ces tests couvrent l’unicité du statut (y compris un échec de sauvegarde), le focus restauré, le redimensionnement sans nouvelle frame, les proportions, le Diagnostic, les ressources SVG, les états normal/survol/focus/désactivé, les boutons d’ouverture et les transitions du contrôleur. Les nouveaux cas vérifient le démarrage en plein écran désactivé par défaut puis activé après relance ; F11/Échap dans les deux modes, avec restauration normale/maximisée puis démaximisation ; l'absence de changement des opérations caméra du véritable contrôleur avec caméra simulée ; les noms exacts des ressources manquantes et les octets/pixels originaux ; le pied de page dans les limites de la fenêtre ; les protections de fermeture, y compris un délai de shutdown dépassé. Les commandes restent accessibles dans les zones logiques 1280 × 720, 1024 × 576, 854 × 480 et 838 × 400 (marge pour la barre des tâches et les décorations), sans agrandissement forcé de la fenêtre, même Diagnostic ouvert.
+
+Tests ciblés exécutés pour cette PR dans le sandbox Linux, avec NumPy 2.5.3, OpenCV 5.0.0 et PySide6 6.11.2 :
+
+| Commande | Résultat |
+| --- | --- |
+| `python -m pytest tests/test_engine.py tests/test_processing.py -q` | 111 réussis |
+| `python -m pytest tests/test_storage.py tests/test_archive.py -q` | 68 réussis |
+| `python -m pytest tests/test_cli.py -q` | 6 réussis |
+| `python -m pytest tests/test_packaging.py -q` | 16 réussis, wheel construit et ressources vérifiées |
+
+Les essais de caméra utilisent des doubles et de petits buffers synthétiques. Aucun essai B0494C, benchmark USB ni exécutable Windows n'est validé par ces résultats.
 
 Les facteurs Qt sous Linux ne remplacent **pas** une validation Windows : reconstruire puis vérifier l'exécutable, l'icône de fenêtre/barre des tâches, Segoe UI, survol/focus/désactivation, plein écran et absence de texte coupé sur un écran Windows 1280 × 720 à chaque mise à l'échelle réelle 100/125/150 %, ainsi que tous les essais matériels ci-dessus. Ces validations Windows et caméra physique restent à faire.
 

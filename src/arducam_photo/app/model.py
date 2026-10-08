@@ -1,4 +1,4 @@
-"""Qt-free orchestration of the Start / Preview / Capture modes, profile and settings."""
+"""Qt-free orchestration of Start / Preview / Capture / Processing, profiles and settings."""
 
 from __future__ import annotations
 
@@ -124,18 +124,24 @@ class SessionModel:
     def enter_preview(self) -> None:
         """Start (or Capture) -> Preview: opens the camera on the worker."""
         self._require_mode(START, CAPTURE_MODE, PROCESSING_MODE)
+        leaving_processing = self.mode == PROCESSING_MODE
         self._load_saved()
         base = self.saved or ShootingProfile()
+        fps = base.fps
+        if base.path != self.path or fps is None or any("cadence" in p for p in base.problems()):
+            fps = MODES[self.path].fps
         self.draft = dataclasses.replace(
             base, camera_key=self.camera.key, camera_index=self.camera.index,
             camera_fragile=self.camera.fragile, path=self.path, api=self.api,
-            fps=base.fps if base.path == self.path and base.fps is not None else MODES[self.path].fps)
+            fps=fps)
         self.pending = "preview"
         try:
             self.controller.open_preview(self.camera.index, self.api, self.path)
         except Exception:
             self.pending = None
             raise
+        if leaving_processing:
+            self._ui("processing_cleared")
 
     def request_capture_mode(self, decision: Optional[str] = None) -> bool:
         """Go to Capture. Returns False if the user stays in Preview. May raise NeedsDecision."""
@@ -167,10 +173,10 @@ class SessionModel:
             self.pending = target
             self.controller.close_preview()  # worker releases the camera, then preview_closed
         else:
+            self._load_saved()
             if self.mode == PROCESSING_MODE:
                 self.controller.clear_processed()
                 self._ui("processing_cleared")
-            self._load_saved()
             self.mode = target
             self._ui("mode_changed", mode=self.mode)
         return True
@@ -189,7 +195,7 @@ class SessionModel:
         except CaptureConfigError:
             if self.controller.legacy_capture:
                 raise
-            ccm = "ressource-CCM-indisponible.json"
+            ccm = None
         cfg = CaptureConfig(camera_index=profile.camera_index, api=profile.api, path=profile.path,
                             focus=profile.focus_requested, ccm_path=ccm if native else None,
                             apply_ccm=native)
@@ -199,7 +205,7 @@ class SessionModel:
 
     def ccm_status(self) -> str:
         if (self.saved.path if self.saved else self.path) != NATIVE_108MP:
-            return "Correction couleur : non applicable (720p)"
+            return "Correction couleur : non applicable (mode couleur)"
         try:
             path = self.effective_ccm_path()
             load_ccm_file(path)
@@ -219,7 +225,7 @@ class SessionModel:
         try:
             ccm = self.effective_ccm_path() if recipe.apply_ccm else None
         except CaptureConfigError:
-            ccm = "ressource-CCM-indisponible.json"
+            ccm = None
         self.controller.process(self.processing_source, recipe, ccm)
 
     def save_processed(self, options) -> None:
@@ -228,7 +234,10 @@ class SessionModel:
 
     def set_fps(self, value: float) -> None:
         self._require_mode(PREVIEW_MODE)
-        self.draft = dataclasses.replace(self.draft, fps=float(value))
+        candidate = dataclasses.replace(self.draft, fps=value)
+        if any("cadence" in problem for problem in candidate.problems()):
+            raise CaptureConfigError("cadence photo hors plage")
+        self.draft = candidate
 
     def shutdown(self, timeout: Optional[float] = None) -> bool:
         done = self.controller.shutdown(timeout)

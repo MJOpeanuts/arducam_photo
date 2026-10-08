@@ -236,6 +236,7 @@ def test_acquire_independent_of_ccm_owns_original(small_raw, monkeypatch):
     assert result.info.capture_id and result.info.captured_at.endswith("+00:00")
     assert result.info.timings["acquisition_s"] >= result.info.timings["read_s"] >= 0
     assert result.info.timings["release_s"] >= 0
+    assert result.info.camera_released and result.info.release_error is None
     assert not result.info.ccm_applied
 
 
@@ -303,6 +304,41 @@ def test_release_has_separate_timing(small_raw):
     timings = result.info.timings
     assert timings["release_s"] >= 0.01
     assert timings["acquisition_s"] >= timings["release_s"] + timings["read_s"] + timings["copy_s"]
+
+
+def test_release_failure_preserves_original_and_blocks_next_capture(small_raw, monkeypatch):
+    monkeypatch.setattr(engine, "_release_failure", None)
+    source = good_raw()[1]
+
+    class BrokenRelease(FakeCap):
+        def release(self):
+            source[:] = 0
+            raise RuntimeError("driver cannot release")
+
+    acquired = ap.acquire(ap.CaptureConfig(stabilization_reads=0),
+                          _opener=opener_for(BrokenRelease([(True, source)])))
+    assert np.all(acquired.original == 100) and acquired.original.shape == (8, 12)
+    assert acquired.info.camera_released is False
+    assert "driver cannot release" in acquired.info.release_error
+    assert acquired.info.timings["release_s"] >= 0
+    opener = opener_for(FakeCap([good_raw()]))
+    with pytest.raises(ap.CameraSetupError, match="restart"):
+        ap.acquire(ap.CaptureConfig(), _opener=opener)
+    assert opener.calls == [] and not engine._busy.locked()
+
+
+def test_capture_release_error_carries_acquisition(small_raw, monkeypatch):
+    monkeypatch.setattr(engine, "_release_failure", None)
+
+    class BrokenRelease(FakeCap):
+        def release(self):
+            raise RuntimeError("release failed")
+
+    with pytest.raises(ap.CameraSetupError) as caught:
+        ap.capture(ap.CaptureConfig(stabilization_reads=0),
+                   _opener=opener_for(BrokenRelease([good_raw()])))
+    assert caught.value.acquisition_result.original.shape == (8, 12)
+    assert caught.value.acquisition_result.info.release_error
 
 
 def test_native_mode_geometry():

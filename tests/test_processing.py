@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import pytest
 
-from arducam_photo import IspError, ProcessingRecipe, process_image
+from arducam_photo import CaptureConfigError, IspError, ProcessingRecipe, process_image
 from arducam_photo.isp import process_raw
 
 
@@ -47,6 +47,29 @@ def test_reference_ccm_temperature(tmp_path):
     assert high[4, 4, 0] >= 190 and high[4, 4, 2] < 10
     assert 90 <= middle[4, 4, 0] <= 110 and 90 <= middle[4, 4, 2] <= 110
     assert raw[0, 1] == 216
+
+
+def test_snapshot_ccm_is_used_without_file_and_is_not_mutated():
+    import copy
+    entries = [{"ct": 4000, "ccm": [[0, 0, 1], [0, 1, 0], [1, 0, 0]]}]
+    before = copy.deepcopy(entries)
+    raw = np.zeros((8, 8), np.uint8)
+    raw[0::2, 1::2] = 216
+    image = process_image(raw, ProcessingRecipe(), raw=True,
+                          ccm_path="no-longer-exists.json", ccm_entries=entries)
+    assert image[4, 4, 0] >= 190 and image[4, 4, 2] < 10
+    assert entries == before
+    assert np.array_equal(image, process_image(raw, ProcessingRecipe(), raw=True, ccm_entries=entries))
+
+
+@pytest.mark.parametrize("entries", [
+    [], {}, [{"ct": float("nan"), "ccm": [1] * 9}],
+    [{"ct": 4000, "ccm": [1] * 8}], [{"ct": 4000, "ccm": [float("inf")] * 9}],
+    [{"ct": 5000, "ccm": [1] * 9}, {"ct": 3000, "ccm": [1] * 9}],
+])
+def test_invalid_ccm_snapshot(entries):
+    with pytest.raises(CaptureConfigError):
+        process_image(np.zeros((8, 8), np.uint8), ProcessingRecipe(), raw=True, ccm_entries=entries)
 
 
 def test_colour_default_identity_and_bgr_grayscale():

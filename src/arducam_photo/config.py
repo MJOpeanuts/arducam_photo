@@ -120,6 +120,8 @@ class AcquisitionInfo:
     timings: dict = field(default_factory=dict)
     capture_id: str = ""
     captured_at: str = ""
+    camera_released: bool = False
+    release_error: Optional[str] = None
 
 
 @dataclass(frozen=True)

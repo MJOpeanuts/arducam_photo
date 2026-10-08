@@ -35,6 +35,7 @@ RAW_BYTES = RAW_ROWS * RAW_COLS  # 108_000_000
 P720_W, P720_H, P720_FPS = 1280, 720, 10
 
 _busy = threading.Lock()
+_release_failure: Optional[str] = None
 
 
 def _open_video_capture(index: int, api: str):
@@ -105,6 +106,10 @@ def capture(
 ) -> CaptureResult:
     """Compatibility facade: acquire and release, then render the owned original."""
     acquired = acquire(config, cancel_event=cancel_event, _opener=_opener)
+    if acquired.info.release_error:
+        error = CameraSetupError(acquired.info.release_error)
+        error.acquisition_result = acquired
+        raise error
     _check_cancel(cancel_event)
     cfg = acquired.info.config
     native = cfg.path == NATIVE_108MP
@@ -127,18 +132,28 @@ def acquire(
     cancel_event: Optional[threading.Event] = None,
     _opener: Optional[Callable] = None,
 ) -> AcquisitionResult:
-    """Acquire an owned original without tuning or ISP; release before returning."""
+    """Acquire without ISP, copy the original, then attempt release before returning.
+
+    A completed original survives release failure: inspect info.release_error,
+    archive first, and report the failure. Further acquisitions are refused until
+    process restart because the driver's ownership state is unknown.
+    """
     cfg = dataclasses.replace(config)  # frozen copy for this acquisition
     cfg.validate()
     if not _busy.acquire(blocking=False):
         raise CaptureBusyError("another capture is already running")
     try:
+        if _release_failure is not None:
+            raise CameraSetupError(
+                f"previous camera release failed; restart before another acquisition: {_release_failure}"
+            )
         return _run(cfg, cancel_event, _opener or _open_video_capture)
     finally:
         _busy.release()
 
 
 def _run(cfg, cancel, opener) -> AcquisitionResult:
+    global _release_failure
     t0 = time.monotonic()
     native = cfg.path == NATIVE_108MP
     mode = MODES[cfg.path]
@@ -148,6 +163,8 @@ def _run(cfg, cancel, opener) -> AcquisitionResult:
 
     log.info("open api=%s index=%d path=%s", cfg.api, cfg.camera_index, cfg.path)
     cap = opener(cfg.camera_index, cfg.api)
+    result = None
+    release_error = None
     try:
         if cap is None or not cap.isOpened():
             raise CameraOpenError(
@@ -211,14 +228,18 @@ def _run(cfg, cancel, opener) -> AcquisitionResult:
         try:
             if cap is not None:
                 cap.release()
-        except Exception:
+        except Exception as error:
             log.exception("release failed")
-            raise CameraSetupError("camera release failed")
+            release_error = f"camera release failed: {error}"
+            _release_failure = release_error
+            if result is None:
+                raise CameraSetupError(release_error) from error
         release_s = time.monotonic() - release_started
     elapsed = time.monotonic() - t0
     return dataclasses.replace(result, info=dataclasses.replace(
         result.info, duration_s=elapsed,
-        timings={**result.info.timings, "release_s": release_s, "acquisition_s": elapsed}
+        timings={**result.info.timings, "release_s": release_s, "acquisition_s": elapsed},
+        camera_released=release_error is None, release_error=release_error,
     ))
 
 

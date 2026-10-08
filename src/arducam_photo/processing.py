@@ -8,7 +8,7 @@ import math
 import cv2
 import numpy as np
 
-from .ccm import load_ccm_file
+from .ccm import load_ccm_file, validate_ccm_entries
 from .errors import IspError
 from .isp import process_raw
 
@@ -58,13 +58,15 @@ class ProcessingRecipe:
             raise IspError("max_dimension must be None or an integer >= 1")
 
 
-def process_image(original, recipe, *, raw=False, ccm_path=None) -> np.ndarray:
+def process_image(original, recipe, *, raw=False, ccm_path=None, ccm_entries=None) -> np.ndarray:
     """Render uint8 Bayer or BGR without changing or aliasing the original.
 
     Minimal RAW only demosaics; black_level subtracts the requested offset;
     reference additionally applies explicitly requested CCM. Colour starts as
     an unchanged copy. Thresholding implies grayscale, CLAHE uses luminance
     for colour, and reduction preserves aspect ratio without upscaling.
+    Provided CCM entries take precedence over a path, so a recorded snapshot
+    renders independently of subsequent tuning-file changes.
     """
     if not isinstance(recipe, ProcessingRecipe):
         raise IspError("recipe must be a ProcessingRecipe")
@@ -80,7 +82,10 @@ def process_image(original, recipe, *, raw=False, ccm_path=None) -> np.ndarray:
         raise IspError("colour original must be a non-empty BGR HxWx3 image")
     try:
         if raw:
-            ccms = load_ccm_file(ccm_path) if recipe.name == "reference" and recipe.apply_ccm else None
+            ccms = None
+            if recipe.name == "reference" and recipe.apply_ccm:
+                ccms = (validate_ccm_entries(ccm_entries) if ccm_entries is not None
+                        else load_ccm_file(ccm_path))
             image = process_raw(
                 original, ccms, black_level=0 if recipe.name == "minimal" else recipe.black_level,
                 temperature=recipe.temperature,

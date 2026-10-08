@@ -35,3 +35,17 @@ def test_cli_unknown_mode_is_not_substituted():
     with pytest.raises(SystemExit) as error:
         main(["--path", "color_108mp", "-o", "photo.png"])
     assert error.value.code == 2
+
+
+def test_cli_reports_preserved_original_after_render_failure(monkeypatch, capsys):
+    import arducam_photo
+
+    def fail(*args, **kwargs):
+        error = arducam_photo.IspError("render failed")
+        error.archive_path = "/photos/source/acquisition.json"
+        raise error
+
+    monkeypatch.setattr(arducam_photo, "capture_and_save", fail)
+    main = runpy.run_path(str(CLI))["main"]
+    assert main(["--path", "native_108mp", "-o", "photo.png"]) == 1
+    assert "Original archivé : /photos/source/acquisition.json" in capsys.readouterr().err
