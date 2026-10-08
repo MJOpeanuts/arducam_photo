@@ -11,14 +11,14 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from ..config import NATIVE_108MP, SettingReport
+from ..config import PATHS, SettingReport
 from ..engine import _import_cv2, _open_video_capture
 from ..errors import CameraOpenError, CameraSetupError
 
 log = logging.getLogger("arducam_photo")
 
 PREVIEW_W, PREVIEW_H = 1280, 720
-PREVIEW_FPS = {NATIVE_108MP: 30, "color_720p": 10}  # starting points, "if available"
+PREVIEW_FPS = {path: 10 for path in PATHS}  # framing only; never promises full photo FoV
 
 
 class PreviewSession:

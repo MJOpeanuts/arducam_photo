@@ -38,4 +38,4 @@ class IspError(CaptureError):
 
 
 class SaveError(CaptureError):
-    """PNG encoding, writing or verification failed."""
+    """Original/output encoding, writing or verification failed."""

@@ -12,12 +12,14 @@ import dataclasses
 import logging
 import threading
 import time
+from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Callable, Optional
 
 import numpy as np
 
 from .ccm import load_ccm_file
-from .config import AcquisitionInfo, CaptureConfig, CaptureResult, SettingReport, NATIVE_108MP
+from .config import AcquisitionInfo, AcquisitionResult, CaptureConfig, CaptureResult, SettingReport, NATIVE_108MP, MODES
 from .errors import (
     CameraOpenError, CameraReadError, CameraSetupError, CaptureBusyError,
     CaptureCancelled, RawBufferError,
@@ -55,7 +57,12 @@ def _check_cancel(ev: Optional[threading.Event]) -> None:
 
 
 def validate_raw_buffer(frame) -> np.ndarray:
-    """Return the flat-compatible uint8 buffer or raise RawBufferError. Never reshapes."""
+    """Validate uint8 packed data, without claiming a hardware-verified layout.
+
+    Accepted layouts are flat (N,) or (1,N), reconstructed Bayer (H,2W)
+    with an optional singleton channel, or packed transport (H,W,2).
+    H and 2W come from RAW_ROWS/RAW_COLS, and N must equal RAW_BYTES.
+    """
     if not isinstance(frame, np.ndarray):
         raise RawBufferError(f"RAW buffer is {type(frame).__name__}, expected numpy.ndarray")
     if frame.dtype != np.uint8:
@@ -65,15 +72,27 @@ def validate_raw_buffer(frame) -> np.ndarray:
             f"RAW buffer has {frame.size} elements / {frame.nbytes} bytes (shape {frame.shape}); "
             f"expected {RAW_BYTES}. The camera is probably not in the 6000x9000 USB 3 mode."
         )
+    plausible = {
+        (RAW_BYTES,), (1, RAW_BYTES),
+        (RAW_ROWS, RAW_COLS), (RAW_ROWS, RAW_COLS, 1),
+        (RAW_ROWS, RAW_COLS // 2, 2),
+    }
+    if frame.shape not in plausible:
+        raise RawBufferError(f"implausible RAW transport shape {frame.shape}; expected packed Bayer/YUY2")
     return frame
 
 
 def validate_720p_frame(frame) -> np.ndarray:
+    return validate_color_frame(frame, P720_W, P720_H)
+
+
+def validate_color_frame(frame, width, height) -> np.ndarray:
     if not isinstance(frame, np.ndarray):
         raise RawBufferError(f"frame is {type(frame).__name__}, expected numpy.ndarray")
-    if frame.dtype != np.uint8 or frame.shape != (P720_H, P720_W, 3):
+    if (frame.dtype != np.uint8 or frame.shape != (height, width, 3)
+            or frame.nbytes != height * width * 3):
         raise RawBufferError(
-            f"720p frame is dtype {frame.dtype} shape {frame.shape}; expected uint8 ({P720_H}, {P720_W}, 3) BGR"
+            f"colour frame is dtype {frame.dtype} shape {frame.shape}; expected uint8 ({height}, {width}, 3) BGR"
         )
     return frame
 
@@ -84,7 +103,31 @@ def capture(
     cancel_event: Optional[threading.Event] = None,
     _opener: Optional[Callable] = None,
 ) -> CaptureResult:
-    """Take one photo. Raises a CaptureError subclass on failure; always releases the camera."""
+    """Compatibility facade: acquire and release, then render the owned original."""
+    acquired = acquire(config, cancel_event=cancel_event, _opener=_opener)
+    _check_cancel(cancel_event)
+    cfg = acquired.info.config
+    native = cfg.path == NATIVE_108MP
+    started = time.monotonic()
+    ccms = load_ccm_file(cfg.ccm_path) if native and cfg.apply_ccm else None
+    image = process_raw(acquired.original, ccms) if native else acquired.original.copy()
+    elapsed = time.monotonic() - started
+    info = dataclasses.replace(
+        acquired.info, ccm_requested=native and cfg.apply_ccm,
+        ccm_applied=ccms is not None, ccm_path=cfg.ccm_path if native and cfg.apply_ccm else None,
+        duration_s=acquired.info.duration_s + elapsed,
+        timings={**acquired.info.timings, "processing_s": elapsed},
+    )
+    h, w = image.shape[:2]
+    return CaptureResult(image=image, width=w, height=h, info=info)
+
+
+def acquire(
+    config: CaptureConfig,
+    cancel_event: Optional[threading.Event] = None,
+    _opener: Optional[Callable] = None,
+) -> AcquisitionResult:
+    """Acquire an owned original without tuning or ISP; release before returning."""
     cfg = dataclasses.replace(config)  # frozen copy for this acquisition
     cfg.validate()
     if not _busy.acquire(blocking=False):
@@ -95,13 +138,12 @@ def capture(
         _busy.release()
 
 
-def _run(cfg, cancel, opener) -> CaptureResult:
+def _run(cfg, cancel, opener) -> AcquisitionResult:
     t0 = time.monotonic()
     native = cfg.path == NATIVE_108MP
-    ccms = None
-    ccm_requested = native and cfg.apply_ccm
-    if ccm_requested:
-        ccms = load_ccm_file(cfg.ccm_path)  # fail before touching the camera
+    mode = MODES[cfg.path]
+    capture_id = str(uuid4())
+    captured_at = datetime.now(timezone.utc).isoformat()
     _check_cancel(cancel)
 
     log.info("open api=%s index=%d path=%s", cfg.api, cfg.camera_index, cfg.path)
@@ -133,40 +175,51 @@ def _run(cfg, cancel, opener) -> CaptureResult:
             setp("height", cv2.CAP_PROP_FRAME_HEIGHT, TRANSPORT_H, True)
             setp("convert_rgb", cv2.CAP_PROP_CONVERT_RGB, 0, True)
         else:
-            transport = (P720_W, P720_H)
-            setp("width", cv2.CAP_PROP_FRAME_WIDTH, P720_W, True)
-            setp("height", cv2.CAP_PROP_FRAME_HEIGHT, P720_H, True)
-            setp("fps", cv2.CAP_PROP_FPS, P720_FPS)
+            transport = mode.transport_size
+            setp("width", cv2.CAP_PROP_FRAME_WIDTH, mode.width, True)
+            setp("height", cv2.CAP_PROP_FRAME_HEIGHT, mode.height, True)
+        setp("fps", cv2.CAP_PROP_FPS, mode.fps if cfg.fps is None else cfg.fps)
         if cfg.focus is not None:
             setp("focus", cv2.CAP_PROP_FOCUS, cfg.focus)
 
-        validate = validate_raw_buffer if native else validate_720p_frame
+        setup_s = time.monotonic() - t0
+        read_started = time.monotonic()
+        validate = validate_raw_buffer if native else lambda f: validate_color_frame(f, mode.width, mode.height)
         frame, frames_read, failed, invalid = _stabilize(cap, cfg, validate, cancel)
 
         _check_cancel(cancel)
-        if native:
-            raw = frame.reshape(RAW_ROWS, RAW_COLS)  # view; buffer already validated
-            image = process_raw(raw, ccms)
-        else:
-            image = frame.copy()  # own the memory beyond the driver's buffer lifetime
+        read_s = time.monotonic() - read_started
+        copy_started = time.monotonic()
+        received_shape = tuple(frame.shape)
+        original = frame.reshape(RAW_ROWS, RAW_COLS).copy() if native else frame.copy()
         del frame
-        h, w = image.shape[:2]
+        h, w = original.shape[:2]
         info = AcquisitionInfo(
             config=cfg, api=cfg.api, camera_index=cfg.camera_index, path=cfg.path,
             transport_size=transport, settings=settings, frames_read=frames_read,
-            failed_reads=failed, invalid_buffers=invalid, ccm_requested=ccm_requested,
-            ccm_applied=ccms is not None, ccm_path=cfg.ccm_path if ccm_requested else None,
+            failed_reads=failed, invalid_buffers=invalid,
             duration_s=time.monotonic() - t0,
+            received_shape=received_shape, reconstructed_shape=tuple(original.shape),
+            dtype=str(original.dtype), capture_id=capture_id, captured_at=captured_at,
+            timings={"setup_s": setup_s, "read_s": read_s, "copy_s": time.monotonic() - copy_started},
         )
         log.info("done %dx%d reads=%d failed=%d invalid=%d ccm=%s %.2fs",
                  w, h, frames_read, failed, invalid, info.ccm_applied, info.duration_s)
-        return CaptureResult(image=image, width=w, height=h, info=info)
+        result = AcquisitionResult(original=original, info=info)
     finally:
+        release_started = time.monotonic()
         try:
             if cap is not None:
                 cap.release()
         except Exception:
             log.exception("release failed")
+            raise CameraSetupError("camera release failed")
+        release_s = time.monotonic() - release_started
+    elapsed = time.monotonic() - t0
+    return dataclasses.replace(result, info=dataclasses.replace(
+        result.info, duration_s=elapsed,
+        timings={**result.info.timings, "release_s": release_s, "acquisition_s": elapsed}
+    ))
 
 
 def _stabilize(cap, cfg, validate, cancel):

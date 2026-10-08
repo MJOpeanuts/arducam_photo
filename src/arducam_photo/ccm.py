@@ -59,6 +59,11 @@ def load_ccm_file(path) -> list:
 
 def select_ccm(ccms: list, ct: float = REFERENCE_CT) -> np.ndarray:
     """Interpolate the 3x3 RGB CCM at color temperature ct (reference: 4000 K)."""
+    if (isinstance(ct, bool) or not isinstance(ct, (int, float))
+            or not math.isfinite(ct) or ct <= 0):
+        raise IspError("CCM temperature must be finite and > 0")
+    if not ccms:
+        raise IspError("CCM list must not be empty")
     if ct <= ccms[0]["ct"]:
         return ccms[0]["ccm"].copy()
     if ct >= ccms[-1]["ct"]:

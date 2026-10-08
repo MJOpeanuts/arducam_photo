@@ -16,15 +16,26 @@ result.info                      # frozen config copy, settings, read counts, cc
 save_png(result.image, r"C:\photos\a.png")   # optional helper
 ```
 
-- `CaptureConfig`: `camera_index`, `api` (`msmf` reference), `path` (`native_108mp` | `color_720p`, always explicit, no fallback), `focus`, `ccm_path`, `apply_ccm`, `stabilization_reads` (default 5, manufacturer starting point, not universal), `max_failed_reads`, `max_invalid_buffers`.
+- `CaptureConfig`: `camera_index`, `api` (`msmf` reference), `path` (four modes below, always explicit, no fallback), `focus`, `fps`, `ccm_path`, `apply_ccm`, `stabilization_reads` (default 5, manufacturer starting point, not universal), `max_failed_reads`, `max_invalid_buffers`.
 - `capture(config, cancel_event=None)` → `CaptureResult(image, width, height, info)`. Errors, all `CaptureError` subclasses: `CaptureConfigError`, `CaptureBusyError`, `CaptureCancelled`, `CameraOpenError`, `CameraSetupError`, `CameraReadError`, `RawBufferError`, `IspError`, `SaveError`.
-- `save_png(image, path, overwrite=False)`: temp file in the same directory, decode-back verification, atomic publish, never replaces an existing file unless `overwrite=True`.
+- `save_png(image, path, overwrite=False)`: colour or grayscale uint8, temp file in the same directory, decode-back verification, never replaces an existing file unless `overwrite=True`.
+- `acquire(config)` returns owned original pixels and acquisition information, **after releasing the camera**, without ISP or storage. `capture()` remains a rendering facade, not an archival API; use `capture_and_save()` or the GUI for automatic original archival.
 - Import has no side effects. One capture at a time per process (`CaptureBusyError`). The camera is opened and released inside each call.
 
 ## Paths
 
-**native_108mp** (USB 3 required): requests 6000×9000 from the driver with `CAP_PROP_CONVERT_RGB=0`, applies focus, reads a bounded number of frames, validates each buffer (uint8, 108 000 000 elements/bytes) *before* reshaping to 9000×12000 Bayer, then black level −16 (saturating), `COLOR_BayerGR2RGB` demosaic (output is used as BGR, as in the reference), and CCM at 4000 K. 6000×9000 is the RAW transport size; the 12000×9000 result adds no pixels. No upscale, no substitution by 720p.
-**color_720p**: 1280×720 at 10 fps, validated as uint8 (720,1280,3) BGR. No RAW processing, no CCM file. Works on USB 2 or 3 if the mode exists. USB speed is **not measured**; a missing mode/wrong buffer size only suggests a link limitation.
+| Mode | Data actually validated | Reference rate, not a guarantee |
+| --- | --- | --- |
+| `color_720p` | 1280×720, uint8 BGR, 3 channels | USB 3 up to 60 fps; USB 2 10 fps |
+| `color_4k` | 3840×2160, uint8 BGR, 3 channels | USB 3 10 fps |
+| `color_12mp` | 4000×3000, uint8 BGR, 3 channels | USB 3 7 fps |
+| `native_108mp` | RAW transport 6000×9000, reconstructed Bayer 12000×9000 | approximately 1 fps announced |
+
+The default requested rates are conservative (10/10/7/1 fps respectively), not latency promises. An explicit rate remains a request: requested, accepted and reported values are recorded separately. The application does **not** measure USB speed, assume identical fields of view, substitute a different resolution/API or treat `cap.set()`/`cap.get()` as proof. Actual buffers must match shape, dtype, channels and byte size.
+
+**native_108mp** (USB 3 required): requests 6000×9000 with `CAP_PROP_CONVERT_RGB=0`, validates **uint8, 108 000 000 bytes**, reconstructs 9000 rows × 12000 columns without adding pixels, copies the original and releases the camera. The accepted transport is **8-bit uint8**: this is not a claim to archive 12/14-bit sensor data or to know the sensor's native depth. Neither 6000×9000 nor 9000×6000 is a native colour mode.
+
+The reference render remains saturating black subtraction 16, `COLOR_BayerGR2RGB` demosaic, then CCM at 4000 K. Its output is used as **BGR**, preserving the existing convention. Synthetic colour-site tests verify the software mapping; the physical Bayer convention and colour accuracy still need a hardware colour-chart check.
 
 `info.settings` gives requested value, `cap.set` return value and driver read-back per setting; a read-back is not proof of physical effect. Autofocus/auto-exposure are not controlled unless you pass `focus`; automatic behaviour may differ between photos. A dark scene is never treated as a failure.
 
@@ -35,8 +46,8 @@ Blocking native calls (no interruptible timeout): `VideoCapture` open, `set`, `r
 - The existing tracked tuning file is bundled at `src/arducam_photo/resources/arducam_108mp.json`, with its contents unchanged. `.gitignore` allows this specific resource while excluding other files with the same name.
 - For the library and CLI, pass this file or your own tuning file via `ccm_path` / `--ccm`; the capture engine still requires an explicit path.
 
-**Default in the GUI**: the app uses the package resource `src/arducam_photo/resources/arducam_108mp.json` (loaded via `importlib.resources`, independent of the current directory; included in wheels through `pyproject.toml`). No file selection is required at first launch. Choosing another file ("Avancé : utiliser un autre arducam_108mp.json…") is an optional override and takes priority over the resource. If the resource is missing or invalid, the 108 MP capture is refused with a precise error; the correction is never silently disabled. Typical flow: `git pull`, `pip install .[gui]`, `arducam-capture`.
-- Validated: JSON object with non-empty `ccms`, each entry `ct` (positive, strictly increasing) and `ccm` (9 finite numbers). Missing/invalid file → `CaptureConfigError` before the camera is opened. `info.ccm_applied` records whether correction ran.
+**Default in the GUI**: the app uses the package resource `src/arducam_photo/resources/arducam_108mp.json` (loaded via `importlib.resources`, independent of the current directory; included in wheels through `pyproject.toml`). No file selection is required at first launch. Choosing another file ("Avancé : utiliser un autre arducam_108mp.json…") is an optional override and takes priority over the resource. A missing/invalid CCM prevents only the render that requires it, **not acquisition or original archival**; correction is never silently disabled. Typical flow: `git pull`, `pip install .[gui]`, `arducam-capture`.
+- Validated: JSON object with non-empty `ccms`, each entry `ct` (positive, strictly increasing) and `ccm` (9 finite numbers). The interpolation temperature is explicit in Traitement; `info.ccm_applied` records whether correction ran.
 
 ## References and licence
 
@@ -46,7 +57,7 @@ Reference demo: https://github.com/ArduCAM/ArducamUVCPythonDemo (branch `Arducam
 
 ```powershell
 git clone https://github.com/MJOpeanuts/arducam_photo; cd arducam_photo
-git checkout copilot/init-arducam-photo   # or the PR branch
+# Use the reviewed PR branch or main once merged.
 py -3.12 -m venv .venv; .\.venv\Scripts\Activate.ps1
 pip install -e ".[test]"
 python -c "import cv2,numpy;print(cv2.__version__,numpy.__version__)"   # expect 5.0.0 / 2.5.3 (opencv-python 5.0.0.93)
@@ -57,6 +68,8 @@ python -c "import cv2;i=cv2.imread(r'$env:TEMP\n1.png');print(i.shape)"  # (9000
 ii $env:TEMP\n1.png
 1..3 | % { python examples\capture_cli.py --path native_108mp --ccm $ccm -o $env:TEMP\s$_.png }
 python examples\capture_cli.py --path color_720p -o $env:TEMP\p720.png
+python examples\capture_cli.py --path color_4k --fps 10 -o $env:TEMP\p4k.png
+python examples\capture_cli.py --path color_12mp --fps 7 -o $env:TEMP\p12mp.png
 python examples\use_as_library.py $ccm $env:TEMP\lib.png
 ```
 Close any camera app first; use `--overwrite` to replace existing files.
@@ -65,11 +78,11 @@ Close any camera app first; use `--overwrite` to replace existing files.
 
 | | |
 |---|---|
-| Implemented | both paths, CCM loader/ISP, PNG helper, CLI + library example, Windows CI workflow |
+| Implemented | four modes, original archival, offline recipes, three-tab GUI, PNG/JPEG outputs, CLI + library example, Windows CI workflow |
 | Tested automatically (simulated camera, tiny Bayer images) | buffer validation, transient frames, bounds, open/read failure, no fallback, channel order, release on success/error, concurrency, import side effects, PNG round-trip, CCM errors, 720p isolation |
 | Measured (Linux sandbox, synthetic) | ISP at 9000×12000 incl. CCM: ~0.6 s, ~0.76 GB peak RSS; not representative of Windows |
 | Tested on hardware | **nothing yet** (no camera in Codespace) |
-| To verify on hardware | direct native capture without preview, 12000×9000 content, focus/colour vs. demo, successive captures, camera freed, 720p, import from a second program |
+| To verify on hardware | direct native capture, 12000×9000 content, focus/colour vs. demo, successive captures, camera freed, all colour modes and actual framing, offline reprocessing, portable Windows |
 
 The milestone is **not** validated by simulated tests alone.
 
@@ -86,9 +99,26 @@ run_arducam_capture.cmd                                 # double-click launcher
 
 Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), leave the bundled CCM selected by default, open **Preview / Réglages**, set the focus (0–1023, numeric + slider; no autofocus or calibrated distance), **Enregistrer**, go to **Capture**, press **PHOTO**. PNGs go to `Pictures\ArducamCapture` (real, possibly OneDrive-redirected folder; changeable). Unique file names; nothing is overwritten, moved or deleted.
 
-**Modes.** Start: nothing is opened. Preview: 1280×720 at 30 fps (108 MP path, "if available") or 10 fps (720p), acquired and displayed FPS measured separately, manual focus with requested vs read-back value, unsaved-changes indicator and prompt (save / discard / stay). Capture: no video and no camera read while waiting; the saved profile is frozen at trigger time, the existing engine runs on the worker thread, the focus is reapplied each capture, the camera is released after (also on error), and the app stays in Capture (the preview never restarts by itself). A second trigger and mode changes are refused during a capture. Progress is shown by steps, without percentage.
+**Navigation.** Start: nothing is opened. **Preview** keeps the existing image, focus controls, profile save and save/discard/stay prompt; the framing preview is not a claim about the photo mode's field of view. Leaving it closes and releases the stream. **Capture** has no live video while waiting; its compact mode selector is explicit and an incompatible saved profile cannot be silently reused. PHOTO freezes the configuration. A second trigger and incompatible transitions are refused while work runs. Capture retains the last still image after success or recoverable error and never restarts Preview automatically. **Traitement** loads and processes files without camera access; returning to Capture does not open a stream.
 
-**Architecture.** Qt-free: `app/profile.py` (profile + injectable `ProfileStore`, JSON in `%LOCALAPPDATA%\ArducamCapture`), `app/paths.py`, `app/preview.py` (preview adapter), `app/controller.py` (single worker owning every camera operation; one latest frame, one outstanding notification), `app/model.py` (mode orchestration). Qt: `app/widget.py` (reusable `CameraWidget`, host passes its own `SessionModel`/stores) and `app/main.py`. Frames are deep-copied into `QImage` so Qt never references freed numpy buffers. The profile holds camera id (index only: flagged fragile), path, API, requested focus and read-back; not the RAW transport nor the preview mode. A missing/invalid CCM file refuses the native capture; the correction is never silently disabled. Corrupt JSON files are kept (renamed `.corrupt-*`), never deleted.
+**Architecture.** Qt-free: `engine.py` acquires, `archive.py` and `storage.py` store/verify, `processing.py` describes reproducible recipes, `app/profile.py` keeps injectable JSON profiles in `%LOCALAPPDATA%\ArducamCapture`, `app/preview.py` adapts the preview, `app/controller.py` serializes worker jobs and `app/model.py` orchestrates modes. Qt: `app/widget.py` and the processing view. One latest preview frame and one outstanding notification prevent a backlog. File loading, ISP and writing stay off the GUI thread; processing concurrency is bounded. Display images are owned copies, not references to driver buffers. Old profiles remain readable with explicit defaults; changing the acquisition mode requires compatible settings. Corrupt profile/settings JSON files are kept (renamed `.corrupt-*`), never deleted.
+
+### Original archival and offline processing
+
+The GUI and `capture_and_save()` follow this order: configure/acquire → validate and own pixels → release camera → archive original → render → verify/write output. Each acquisition has a unique directory and source id. `original.npy` contains the unchanged Bayer values, or `original.png` the lossless BGR colour reference; `acquisition.json` relates outputs to this source. Originals are never overwritten or automatically deleted. NumPy loads use `allow_pickle=False` and validate shape, dtype and byte size before processing; stored files have SHA-256 fingerprints and verification.
+
+The manifest records schema/id/timezone, software/library versions (commit when available), camera/API, requested settings and driver replies, transport/reconstructed shapes, dtype, Bayer/channel convention provenance, read counters, files/dimensions/weights/hashes, recipe parameters/version, errors and durations. Detailed timings separate open/configuration, stabilization/acquisition, release, archival, processing, encoding/writing/verification and total availability; Diagnostic shows these without an experiment dashboard.
+
+If rendering fails, an already verified original remains available for reprocessing and its error is recorded. If archival fails (including a full disk), the application does **not** claim the original was preserved. Incomplete or incompatible files are refused; failed saves do not replace an original. A verified data file without its completed manifest is not a successfully completed acquisition.
+
+1. In Capture, use the direct action to open the last acquisition in **Traitement**, or open an existing `acquisition.json` / original file there. Ordinary colour PNG/JPEG images can also be loaded.
+2. Disconnect the camera: all following steps work without it.
+3. For RAW, select **minimal demosaic**, **black level + demosaic without CCM**, or the **reference recipe** (black 16 + demosaic + CCM 4000 K). Advanced settings allow an explicit black level, CCM toggle and interpolation temperature. The source comparison is labelled as a **minimal RAW render**, not a colour photograph of the Bayer mosaic.
+4. Colour operations are opt-in: grayscale, parameterized CLAHE, Otsu/adaptive threshold and aspect-preserving reduction. No automatic threshold or compulsory correction chain, generated detail, super-resolution or automatic quality selection.
+5. Compare source/result with synchronized zoom and pan. The display may use bounded-size views; saved outputs use the recipe's actual dimensions.
+6. Save a **new** PNG (colour/grayscale) or JPEG (configurable quality); source id, recipe and output parameters accompany it. PNG is checked pixel-for-pixel; JPEG is checked for decodability and dimensions, not equality. Reducing a result does not create an acquisition mode. No implicit cropping is performed.
+
+This remains a local camera/photo utility: no campaigns, experiments, annotations, OCR, cloud, server or database. Keep trial notes in Notion.
 
 **Limits.** OpenCV open/set/read/release are native and non-interruptible: no effective timeout or cancellation is promised; closing the window waits (up to 10 s) for the worker and cannot abort a blocked call. If that shutdown wait expires, controls are disabled; a nonblocking Qt timer checks worker completion and the application exits automatically after the worker finishes and releases the camera. A permanently blocked native call can still prevent exit. The 14.2 s of the first test is neither a guarantee nor an end-to-end UI measure. The "last photo" shown is from the current session only. USB speed is never measured. Do not mix OpenCV distributions.
 
@@ -113,19 +143,19 @@ PYTHONPATH=src QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR=1.5 python -m pytest te
 python -m pip wheel . --no-deps -w dist/wheels
 ```
 
-Validation de cette mise à jour sous Linux Qt offscreen à 100 % : **108 tests réussis**, en exécutions séparées (**68 tests hors interface**, dont les 15 tests de packaging, et **40 tests GUI**). Les **40 tests GUI ont aussi réussi à chacun des facteurs Qt 125 % et 150 %**. Aucun résultat Windows ni validation d'un véritable exécutable Windows n'est revendiqué.
+Validation historique de la base `833e50f` sous Linux Qt offscreen à 100 % : **108 tests réussis**, en exécutions séparées (**68 tests hors interface**, dont les 15 tests de packaging, et **40 tests GUI**). Les **40 tests GUI avaient aussi réussi aux facteurs Qt 125 % et 150 %**. Ces chiffres décrivent la base, pas une validation matérielle ni les nouveaux tests de cette PR. Aucun résultat Windows ni validation d'un véritable exécutable Windows n'est revendiqué.
 
 Ces tests couvrent l’unicité du statut (y compris un échec de sauvegarde), le focus restauré, le redimensionnement sans nouvelle frame, les proportions, le Diagnostic, les ressources SVG, les états normal/survol/focus/désactivé, les boutons d’ouverture et les transitions du contrôleur. Les nouveaux cas vérifient le démarrage en plein écran désactivé par défaut puis activé après relance ; F11/Échap dans les deux modes, avec restauration normale/maximisée puis démaximisation ; l'absence de changement des opérations caméra du véritable contrôleur avec caméra simulée ; les noms exacts des ressources manquantes et les octets/pixels originaux ; le pied de page dans les limites de la fenêtre ; les protections de fermeture, y compris un délai de shutdown dépassé. Les commandes restent accessibles dans les zones logiques 1280 × 720, 1024 × 576, 854 × 480 et 838 × 400 (marge pour la barre des tâches et les décorations), sans agrandissement forcé de la fenêtre, même Diagnostic ouvert.
 
 Les facteurs Qt sous Linux ne remplacent **pas** une validation Windows : reconstruire puis vérifier l'exécutable, l'icône de fenêtre/barre des tâches, Segoe UI, survol/focus/désactivation, plein écran et absence de texte coupé sur un écran Windows 1280 × 720 à chaque mise à l'échelle réelle 100/125/150 %, ainsi que tous les essais matériels ci-dessus. Ces validations Windows et caméra physique restent à faire.
 
-Tests de packaging exécutés pour cette mise à jour sous Linux : **15 réussis**
+Tests de packaging historiques de la base sous Linux : **15 réussis**
 (`PYTHONPATH=src python -m pytest tests/test_packaging.py -q`).
 Ils construisent un wheel, vérifient les octets des originaux, les chargent hors
 du dépôt et vérifient la spécification (onedir, sans console, ICO, hooks Qt,
 noms précis des fichiers manquants). Ils ne lancent pas PyInstaller sur Windows.
 
-Captures du **rendu réel Qt**, à 1280 × 720, issues du test de transitions avec caméra simulée (frames noires), et non de maquettes. L’heure affichée vient du fichier produit par le test ; aucune image de démonstration n’est chargée par l’application.
+Captures historiques de la base, du **rendu réel Qt**, à 1280 × 720, issues du test de transitions avec caméra simulée (frames noires), et non de maquettes. Elles ne représentent pas le nouvel onglet Traitement. L’heure affichée vient du fichier produit par le test ; aucune image de démonstration n’est chargée par l’application.
 
 | Preview / Réglages | Capture après enregistrement |
 | --- | --- |
@@ -205,8 +235,17 @@ Avant distribution : extraire l'artifact entier sur un PC Windows 11 x64 sans Py
 déconnecté du réseau, lancer depuis un autre répertoire, vérifier l'icône Nuts,
 le pied de page et le JSON par défaut ; vérifier F11/Échap depuis fenêtre normale
 et maximisée, le démarrage en plein écran persistant et Quitter,
-puis tester preview, focus, captures 108 MP/720p, sauvegarde, relance et libération
+puis tester preview, focus, les quatre modes, archivage, retraitement, relance et libération
 de la caméra avec le matériel réel. Les tests de packaging Linux vérifient les
 ressources originales du wheel et les options de la spécification ; ils ne
 construisent ni ne valident un exécutable Windows. Un build réussi et des tests
 Qt offscreen ne valident pas ces essais physiques Windows.
+
+### Recette matérielle Windows restante
+
+- Tester 720p, **4K et 12 MP** sur la B0494C ; comparer les dimensions **réellement reçues**, les détails et le cadrage de chaque mode (ne pas supposer un champ de vue commun). Essayer la cadence demandée et conserver sa valeur relue, sans en déduire la vitesse USB.
+- Archiver un RAW natif, vérifier le `.npy` et le JSON, **débrancher la caméra**, puis le rouvrir et enregistrer plusieurs recettes et sorties PNG/JPEG sans toucher à l'original.
+- Photographier une mire pour confirmer le motif Bayer, l'ordre BGR/RGB, les couleurs et l'effet de la CCM/noir ; les tests synthétiques ne valident pas la caméra.
+- Répéter au moins 20 captures, surveiller mémoire/réactivité et timings Diagnostic, fermeture/libération, déconnexion/reconnexion et erreurs de disque plein.
+- Tester les trois onglets, les décisions de profil non enregistré, la dernière image après erreur, F11/Échap et les échelles Windows 100/125/150 %.
+- Construire le portable sur Windows, copier **tout** le dossier hors du dépôt sur un PC sans Python et hors réseau, puis tester démarrage, ressources transparentes, archivage et retraitement caméra débranchée.
