@@ -20,16 +20,34 @@ _ORDER = (
 
 def apply_camera_settings(cap, values, cv2_module):
     """Attempt only populated controls; never infer ranges, units, or mode values."""
+    def value(name):
+        return getattr(values, name, None) if not isinstance(values, dict) else values.get(name)
+
+    exposure_mode = value("auto_exposure_mode")
+    wb_mode = value("auto_wb_mode")
+    blocked = {"exposure": exposure_mode == "automatic", "gain": exposure_mode == "automatic",
+               "wb_temperature": wb_mode == "automatic"}
     reports = {}
     for name, constant in _ORDER:
-        requested = getattr(values, name, None) if not isinstance(values, dict) else values.get(name)
+        requested = value(name)
         if requested is None:
+            continue
+        mode = exposure_mode if name in ("auto_exposure", "exposure", "gain") else (
+            wb_mode if name in ("auto_wb", "wb_temperature") else None
+        )
+        if blocked.get(name):
+            reports[name] = SettingReport(
+                requested, None, attempted=False,
+                error="manual control not attempted while automatic mode is active",
+                mode=mode,
+            )
             continue
         prop = getattr(cv2_module, constant, None)
         if prop is None:
             reports[name] = SettingReport(
                 requested, None, attempted=False,
                 error=f"{constant} is unavailable in this OpenCV build",
+                mode=mode,
             )
             continue
         accepted, readback, error, readback_error = None, None, None, None
@@ -43,7 +61,7 @@ def apply_camera_settings(cap, values, cv2_module):
             readback_error = str(exc)
         reports[name] = SettingReport(
             requested, accepted, readback, attempted=True, error=error,
-            readback_error=readback_error,
+            readback_error=readback_error, mode=mode,
         )
     return reports
 
@@ -53,7 +71,7 @@ def read_camera_settings(cap, reports, cv2_module):
     updated = dict(reports)
     for name, constant in _ORDER:
         previous = updated.get(name)
-        if previous is None:
+        if previous is None or not previous.attempted:
             continue
         prop = getattr(cv2_module, constant, None)
         if prop is None:

@@ -400,7 +400,6 @@ class CameraController:
             self._emit("capture_step", step="Acquisition de l’original")
             acquisition = engine.acquire(job.config, cancel_event=self._cancel, _opener=self._opener)
             timings["acquisition_s"] = self._clock() - started
-            capture_manifest = begin_capture_bundle(acquisition, job.photo_dir)
             stage = "archive"
             release_error = getattr(acquisition.info, "release_error", None)
             if release_error:
@@ -408,6 +407,7 @@ class CameraController:
             self._emit("capture_step", step="Archivage de l’original"
                        + (" · libération caméra échouée" if release_error else " · caméra libérée"))
             t = self._clock()
+            capture_manifest = begin_capture_bundle(acquisition, job.photo_dir)
             manifest = archive_acquisition(acquisition, job.photo_dir)
             timings["archive_s"] = self._clock() - t
             timings["total_until_archive_s"] = self._clock() - started
@@ -435,7 +435,6 @@ class CameraController:
             t = self._clock()
             archive_output = save_output(image, manifest, recipe, OutputOptions(), ccm_provenance=ccm,
                                          timings=timings)
-            path = finish_capture_bundle(capture_manifest, image, recipe, ccm)
             timings["output_s"] = self._clock() - t
             timings["total_until_output_s"] = self._clock() - started
 
@@ -444,6 +443,7 @@ class CameraController:
                                        timings={**info.timings, **timings})
             h, w = image.shape[:2]
             thumb = _thumbnail(image)
+            path = finish_capture_bundle(capture_manifest, image, recipe, ccm)
             del image
             self._emit("capture_done", path=path, thumbnail=thumb, info=info, size=(w, h),
                        manifest_path=manifest, timings=timings)
@@ -463,7 +463,9 @@ class CameraController:
                 except Exception:
                     log.exception("could not record capture bundle error")
             self._emit("capture_failed", error=_detach_error(e), recoverable=True, archive_path=manifest,
-                       capture_manifest_path=capture_manifest, stage=stage, timings=timings)
+                       capture_manifest_path=capture_manifest,
+                       raw_preserved=bool(capture_manifest and job.config.path == NATIVE_108MP),
+                       stage=stage, timings=timings)
         finally:
             self._set_state(IDLE)
             self._emit("capture_idle")

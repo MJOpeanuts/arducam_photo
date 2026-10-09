@@ -16,7 +16,7 @@ result.info                      # frozen config copy, settings, read counts, cc
 save_png(result.image, r"C:\photos\a.png")   # optional helper
 ```
 
-- `CaptureConfig`: `camera_index`, `api` (`msmf` reference), `path` (four modes below, always explicit, no fallback), `focus`, `fps`, `ccm_path`, `apply_ccm`, `stabilization_reads` (default 5, manufacturer starting point, not universal), `max_failed_reads`, `max_invalid_buffers`.
+- `CaptureConfig`: `camera_index`, `api` (`msmf` reference), `path` (four modes below, always explicit, no fallback), `focus`, `exposure`, `auto_exposure`, `auto_exposure_mode`, `gain`, `auto_wb`, `auto_wb_mode`, `wb_temperature`, `brightness`, `contrast`, `saturation`, `fps`, `ccm_path`, `apply_ccm`, `stabilization_reads` (default 5, manufacturer starting point, not universal), `max_failed_reads`, `max_invalid_buffers`.
 - `capture(config, cancel_event=None)` → `CaptureResult(image, width, height, info)`. Errors, all `CaptureError` subclasses: `CaptureConfigError`, `CaptureBusyError`, `CaptureCancelled`, `CameraOpenError`, `CameraSetupError`, `CameraReadError`, `RawBufferError`, `IspError`, `SaveError`.
 - `save_png(image, path, overwrite=False)`: colour or grayscale uint8, temp file in the same directory, decode-back verification, never replaces an existing file unless `overwrite=True`.
 - `acquire(config)` returns owned original pixels and acquisition information, **after releasing the camera**, without ISP or storage. `capture()` remains a rendering facade, not an archival API; use `capture_and_save()` or the GUI for automatic original archival.
@@ -37,7 +37,9 @@ The default requested rates are conservative (10/10/7/1 fps respectively), not l
 
 The reference render remains saturating black subtraction 16, `COLOR_BayerGR2RGB` demosaic, then CCM at 4000 K. Its output is used as **BGR**, preserving the existing convention. Synthetic colour-site tests verify the software mapping; the physical Bayer convention and colour accuracy still need a hardware colour-chart check.
 
-`info.settings` gives requested value, `cap.set` return value and driver read-back per setting; a read-back is not proof of physical effect. Autofocus/auto-exposure are not controlled unless you pass `focus`; automatic behaviour may differ between photos. A dark scene is never treated as a failure.
+`info.settings` distinguishes the requested value, whether a command was attempted, `cap.set` result, read-back, exceptions/availability, and known mode. These controls are shared by Preview and one-shot acquisition. Empty/`None` values mean leave the control untouched; read-back `0` is retained as a value, not treated as unsupported. A read-back or accepted command is not proof of physical effect.
+
+OpenCV exposes these controls through backend-specific `CAP_PROP_*` properties; the code does not invent ranges, units, or automatic/manual toggle values. UI auto-mode values are the raw numeric value required by the selected backend. Select *Automatic* or *Manual* explicitly only after consulting that backend/driver's documented value; incompatible manual exposure/gain or white-balance-temperature commands are then disabled and not attempted. If a property constant is missing, `cap.set()` returns false, or a read fails, the report identifies that limitation instead of claiming it was applied. OpenCV index/API identity is the only camera identity currently available. No autofocus is assumed: focus remains manual motorized.
 
 Blocking native calls (no interruptible timeout): `VideoCapture` open, `set`, `read`. Cancellation (`cancel_event`) is only checked between them; stabilization is bounded by read counts. COM: handled by OpenCV MSMF in the calling thread; the module does not call COM.
 
@@ -67,20 +69,28 @@ Test-Path $ccm   # or explicitly select your own tuning file
 python examples\capture_cli.py --path native_108mp --ccm $ccm --focus 187 -o $env:TEMP\n1.png -v
 python -c "import cv2;i=cv2.imread(r'$env:TEMP\n1.png');print(i.shape)"  # (9000, 12000, 3)
 ii $env:TEMP\n1.png
+# Inspect the matching UUID-prefixed .raw/.json/.png files in the selected output folder.
+# Repeat with color_720p: JSON must say RAW unavailable and there must be no .raw.
 1..3 | % { python examples\capture_cli.py --path native_108mp --ccm $ccm -o $env:TEMP\s$_.png }
 python examples\capture_cli.py --path color_720p -o $env:TEMP\p720.png
 python examples\capture_cli.py --path color_4k --fps 10 -o $env:TEMP\p4k.png
 python examples\capture_cli.py --path color_12mp --fps 7 -o $env:TEMP\p12mp.png
 python examples\use_as_library.py $ccm $env:TEMP\lib.png
 ```
-Close any camera app first; use `--overwrite` to replace existing files.
+Close any camera app first; the capture bundle is never overwritten. The optional CLI export
+path remains a separate convenience image; use the matching capture UUID files as the traceable set.
+On the real B0494C/Windows backend, consult its documentation for exact auto/manual property values
+before selecting a mode or typing a raw mode command. Confirm the manifest reports attempted,
+accepted and read-back values separately, inspect the raw checksum/byte count, test a rendering
+failure and a no-overwrite collision, and verify the camera is released. Simulated tests do not
+validate driver support, units, physical Bayer pattern, exposure, focus or color.
 
 ## Status
 
 | | |
 |---|---|
-| Implemented | four modes, original archival, offline recipes, three-tab GUI, PNG/JPEG outputs, CLI + library example, Windows CI workflow |
-| Automated coverage (simulated camera, tiny Bayer images) | four modes and substitutions refused, buffer/read bounds, release-before-render, channel order/black/CCM, original round-trip and preservation after errors, PNG/JPEG, deterministic non-mutating recipes, invalid files/collisions/write failures, profile/tab and resource regressions |
+| Implemented | four modes, raw/JSON/PNG capture bundles, original archival, offline recipes, three-tab GUI, PNG/JPEG outputs, CLI + library example, Windows CI workflow |
+| Automated coverage (simulated camera, tiny Bayer images) | setting order and failures, auto/manual incompatibility, legacy profile loading, bundle bytes/hash/strict JSON/partial state/no-overwrite, 720p without RAW, plus acquisition and UI regressions |
 | Historical ISP measurement (base, Linux sandbox, synthetic) | 9000×12000 incl. CCM: ~0.6 s, ~0.76 GB peak RSS; not an end-to-end archival/processing benchmark or representative of Windows |
 | Tested on hardware | **nothing yet** (no camera in Codespace) |
 | To verify on hardware | direct native capture, 12000×9000 content, focus/colour vs. demo, successive captures, camera freed, all colour modes and actual framing, offline reprocessing, portable Windows |
@@ -98,7 +108,7 @@ py -3.12 -m venv .venv
 run_arducam_capture.cmd                                 # double-click launcher
 ```
 
-Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), leave the bundled CCM selected by default, open **Preview / Réglages**, set the focus (0–1023, numeric + slider; no autofocus or calibrated distance), **Enregistrer**, go to **Capture**, press **PHOTO**. PNGs go to `Pictures\ArducamCapture` (real, possibly OneDrive-redirected folder; changeable). Unique file names; nothing is overwritten, moved or deleted.
+Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), leave the bundled CCM selected by default, open **Preview / Réglages**, set the focus (0–1023, numeric + slider; no autofocus or calibrated distance), optionally expand **Autres réglages caméra**, **Enregistrer**, go to **Capture**, press **PHOTO**. Each successful photo writes `<capture_id>.raw`, `<capture_id>.json`, and `<capture_id>.png` in the chosen photo folder; 720p writes JSON and PNG only. Existing files are never overwritten.
 
 **Navigation.** Start: nothing is opened. **Preview** keeps the existing image, focus controls, profile save and save/discard/stay prompt; the framing preview is not a claim about the photo mode's field of view. Leaving it closes and releases the stream. **Capture** has no live video while waiting; its compact mode selector is explicit and an incompatible saved profile cannot be silently reused. PHOTO freezes the configuration. A second trigger and incompatible transitions are refused while work runs. Capture retains the last still image after success or recoverable error and never restarts Preview automatically. **Traitement** loads and processes files without camera access; returning to Capture does not open a stream.
 
@@ -106,11 +116,11 @@ Quick trial on your PC: close other camera apps, start the app, choose *Photo 10
 
 ### Original archival and offline processing
 
-The GUI and `capture_and_save()` follow this order: configure/acquire → validate and own pixels → release camera → archive original → render → verify/write output. Each acquisition has a unique directory and source id. `original.npy` contains the unchanged Bayer values, or `original.png` the lossless BGR colour reference; `acquisition.json` relates outputs to this source. Originals are never overwritten or automatically deleted. NumPy loads use `allow_pickle=False` and validate shape, dtype and byte size before processing; stored files have SHA-256 fingerprints and verification.
+The GUI and `capture_and_save()` follow this order: configure/acquire → validate and own pixels → release camera → publish capture RAW/JSON → archive original → render → verify/write output. Each successful capture has a common UUID prefix for the three files. `.raw` is headerless C-order uint8 bytes of the unchanged 9000 × 12000 Bayer array; the JSON records its dimensions, organization, size and SHA-256. The code's existing reference pipeline maps the synthetic sites to an RGGB software convention (`COLOR_BayerGR2RGB` output is treated as BGR); the physical sensor pattern is not hardware-validated. 720p explicitly records that no native RAW exists. The existing per-acquisition folder (`original.npy` / `original.png` and `acquisition.json`) remains available for offline processing.
 
-The manifest records schema/id/timezone, software/library versions (commit when available), camera/API, requested settings and driver replies, transport/reconstructed shapes, dtype, Bayer/channel convention provenance, read counters, files/dimensions/weights/hashes, recipe parameters/version, errors and durations. Detailed timings separate open/configuration, stabilization/acquisition, release, archival, processing, encoding/writing/verification and total availability; Diagnostic shows these without an experiment dashboard.
+The per-capture JSON schema version 1 separates `acquisition` from `processing`. It records capture ID/timezone, program version/commit when available, camera index/backend, mode, transport/image geometry, requested controls and reports, readback time (not a guaranteed synchronized sensor measurement), stabilization counts, RAW format/checksum and processing recipe, black level, demosaic, CCM temperature/matrix and tuning-file fingerprint. Unknown identity/readback data are null. The internal acquisition manifest continues to record detailed archival/output timings and offline provenance.
 
-If rendering fails, an already verified original remains available for reprocessing and its error is recorded. If archival fails (including a full disk), the application does **not** claim the original was preserved. Incomplete or incompatible files are refused; failed saves do not replace an original. A verified data file without its completed manifest is not a successfully completed acquisition.
+The capture writer uses same-directory temporary files and verifies RAW size/hash and strict JSON correspondence before publishing; files are published individually, not as an atomic multi-file transaction. A hidden `.<capture_id>.incomplete` marker remains until JSON and PNG are verified and the final JSON is committed, so partial triplets are detectable. A RAW/JSON pair is saved before rendering. If rendering/PNG writing fails, the pair remains, the JSON records `processing.status=failed`, and the UI reports that RAW was preserved but processing failed. If storage fails, the capture is reported as failed; recoverable temporary/original data are not silently removed by the capture-bundle writer. An incomplete or incompatible capture is never announced as successful.
 
 No-overwrite publication requires filesystem hard-link support (for example NTFS); unsupported filesystems fail explicitly rather than risk replacing an original. A driver release exception is reported separately: validated pixels can still be archived, but further camera access is refused until application restart because exclusive ownership is no longer provable.
 

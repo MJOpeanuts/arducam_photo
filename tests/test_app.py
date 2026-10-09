@@ -159,6 +159,26 @@ def test_capture_uses_saved_focus_and_frozen_profile_no_auto_preview(env):
     assert env.model.last_photo and os.path.exists(env.model.last_photo)
 
 
+def test_capture_freezes_all_profile_camera_controls(env):
+    env.preview()
+    env.set_focus_and_save(321)
+    env.model.set_camera_control("auto_exposure", 0.25)
+    env.wait("camera_settings_applied")
+    env.model.set_camera_mode("auto_exposure_mode", "manual")
+    env.wait("camera_settings_applied", nth=2)
+    env.model.set_camera_control("exposure", 3.5)
+    env.wait("camera_settings_applied", nth=3)
+    env.model.set_camera_control("brightness", 0.0)
+    env.wait("camera_settings_applied", nth=4)
+    env.model.save_profile()
+    to_capture(env)
+    env.model.trigger()
+    env.wait("capture_idle")
+    cfg = env.captures[0]
+    assert cfg.auto_exposure == 0.25 and cfg.auto_exposure_mode == "manual"
+    assert cfg.exposure == 3.5 and cfg.brightness == 0.0
+
+
 def test_double_trigger_and_mode_changes_refused_during_capture(env):
     env.preview(); env.set_focus_and_save()
     to_capture(env)
@@ -460,6 +480,21 @@ def test_old_profile_missing_fps_remains_unspecified_and_new_preview_adapts(env)
     env.model.set_fps(3)
     env.model.save_profile()
     assert env.profiles.load("index:0").fps == 3
+
+
+def test_old_profile_loads_new_camera_controls_as_unset(env):
+    old = ShootingProfile.from_dict({
+        "camera_key": "index:0", "camera_index": 0, "path": "native_108mp",
+        "api": "msmf", "focus_requested": 300,
+    })
+    assert old.exposure is None and old.auto_exposure is None
+    assert old.auto_exposure_mode is None and old.auto_wb_mode is None
+    updated = dataclasses.replace(old, exposure=1.5, auto_exposure=0.25,
+                                  auto_exposure_mode="automatic", gain=2.0)
+    env.profiles.save(updated)
+    restored = env.profiles.load("index:0")
+    assert restored.exposure == 1.5 and restored.auto_exposure_mode == "automatic"
+    assert restored.gain == 2.0 and restored.wb_temperature is None
 
 
 @pytest.mark.parametrize("fps", [0, float("nan"), True, "fast"])

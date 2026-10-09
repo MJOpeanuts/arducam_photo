@@ -49,8 +49,10 @@ class ShootingProfile:
     focus_verified: Optional[bool] = None
     exposure: Optional[float] = None
     auto_exposure: Optional[float] = None
+    auto_exposure_mode: Optional[str] = None
     gain: Optional[float] = None
     auto_wb: Optional[float] = None
+    auto_wb_mode: Optional[str] = None
     wb_temperature: Optional[float] = None
     brightness: Optional[float] = None
     contrast: Optional[float] = None
@@ -77,6 +79,10 @@ class ShootingProfile:
                 or not math.isfinite(value)
             ):
                 out.append(f"{name} invalide")
+        for name, command in (("auto_exposure_mode", "auto_exposure"), ("auto_wb_mode", "auto_wb")):
+            mode = getattr(self, name)
+            if mode not in (None, "automatic", "manual") or (mode is not None and getattr(self, command) is None):
+                out.append(f"{name} invalide ou sans valeur backend")
         if self.fps is not None and (isinstance(self.fps, bool) or not isinstance(self.fps, (int, float))
                                      or not math.isfinite(self.fps) or not 0 < self.fps <= 120):
             out.append("cadence hors plage")
@@ -91,7 +97,7 @@ class ShootingProfile:
         if other is None:
             return False
         keys = ("camera_key", "camera_index", "path", "api", "focus_requested", "fps",
-                "exposure", "auto_exposure", "gain", "auto_wb", "wb_temperature",
+                "exposure", "auto_exposure", "auto_exposure_mode", "gain", "auto_wb", "auto_wb_mode", "wb_temperature",
                 "brightness", "contrast", "saturation")
         return all(getattr(self, k) == getattr(other, k) for k in keys)
 

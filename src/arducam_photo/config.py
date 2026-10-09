@@ -62,8 +62,10 @@ class CaptureConfig:
     focus: Optional[int] = None
     exposure: Optional[float] = None
     auto_exposure: Optional[float] = None
+    auto_exposure_mode: Optional[str] = None
     gain: Optional[float] = None
     auto_wb: Optional[float] = None
+    auto_wb_mode: Optional[str] = None
     wb_temperature: Optional[float] = None
     brightness: Optional[float] = None
     contrast: Optional[float] = None
@@ -92,6 +94,12 @@ class CaptureConfig:
                 or not math.isfinite(value)
             ):
                 raise CaptureConfigError(f"{name} must be None or a finite number")
+        for name, command in (("auto_exposure_mode", "auto_exposure"), ("auto_wb_mode", "auto_wb")):
+            mode = getattr(self, name)
+            if mode not in (None, "automatic", "manual"):
+                raise CaptureConfigError(f"{name} must be None, 'automatic' or 'manual'")
+            if mode is not None and getattr(self, command) is None:
+                raise CaptureConfigError(f"{name} requires a {command} backend value")
         for name in ("stabilization_reads", "max_failed_reads", "max_invalid_buffers"):
             v = getattr(self, name)
             if type(v) is not int or v < 0:

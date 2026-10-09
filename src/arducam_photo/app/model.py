@@ -119,8 +119,36 @@ class SessionModel:
             isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
         ):
             raise CaptureConfigError(f"{name} doit être une valeur numérique finie ou vide")
-        self.draft = dataclasses.replace(self.draft, **{name: value})
-        self.controller.apply_camera_settings({name: value})
+        updates = {name: value}
+        if value is None and name == "auto_exposure":
+            updates["auto_exposure_mode"] = None
+        elif value is None and name == "auto_wb":
+            updates["auto_wb_mode"] = None
+        self.draft = dataclasses.replace(self.draft, **updates)
+        self.controller.apply_camera_settings(self._camera_control_values(self.draft))
+
+    def set_camera_mode(self, name: str, mode: Optional[str]) -> None:
+        if name not in ("auto_exposure_mode", "auto_wb_mode") or mode not in (None, "automatic", "manual"):
+            raise CaptureConfigError("mode automatique caméra invalide")
+        if self.mode != PREVIEW_MODE or self.pending:
+            raise ModeError("réglages caméra uniquement en Preview")
+        command = "auto_exposure" if name == "auto_exposure_mode" else "auto_wb"
+        if mode is not None and getattr(self.draft, command) is None:
+            raise CaptureConfigError(f"renseignez la valeur backend {command} avant de choisir un mode")
+        self.draft = dataclasses.replace(self.draft, **{name: mode})
+        self.controller.apply_camera_settings(self._camera_control_values(self.draft))
+
+    @staticmethod
+    def _camera_control_values(profile):
+        return {
+            "focus": profile.focus_requested, "exposure": profile.exposure,
+            "auto_exposure": profile.auto_exposure,
+            "auto_exposure_mode": profile.auto_exposure_mode,
+            "gain": profile.gain, "auto_wb": profile.auto_wb,
+            "auto_wb_mode": profile.auto_wb_mode,
+            "wb_temperature": profile.wb_temperature, "brightness": profile.brightness,
+            "contrast": profile.contrast, "saturation": profile.saturation,
+        }
 
     def save_profile(self) -> ShootingProfile:
         if self.draft is None:
@@ -215,7 +243,9 @@ class SessionModel:
         cfg = CaptureConfig(camera_index=profile.camera_index, api=profile.api, path=profile.path,
                             focus=profile.focus_requested,
                             exposure=profile.exposure, auto_exposure=profile.auto_exposure,
+                            auto_exposure_mode=profile.auto_exposure_mode,
                             gain=profile.gain, auto_wb=profile.auto_wb,
+                            auto_wb_mode=profile.auto_wb_mode,
                             wb_temperature=profile.wb_temperature, brightness=profile.brightness,
                             contrast=profile.contrast, saturation=profile.saturation,
                             ccm_path=ccm if native else None,
@@ -277,8 +307,10 @@ class SessionModel:
                         "focus": self.draft.focus_requested,
                         "exposure": self.draft.exposure,
                         "auto_exposure": self.draft.auto_exposure,
+                        "auto_exposure_mode": self.draft.auto_exposure_mode,
                         "gain": self.draft.gain,
                         "auto_wb": self.draft.auto_wb,
+                        "auto_wb_mode": self.draft.auto_wb_mode,
                         "wb_temperature": self.draft.wb_temperature,
                         "brightness": self.draft.brightness,
                         "contrast": self.draft.contrast,

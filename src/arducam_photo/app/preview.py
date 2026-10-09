@@ -89,9 +89,7 @@ class PreviewSession:
 
     def set_focus(self, value: int) -> SettingReport:
         """Returns requested value, cap.set result and driver read-back (distinct)."""
-        if self._cap is None:
-            raise CameraSetupError("preview non ouvert")
-        return self._set("focus", _import_cv2().CAP_PROP_FOCUS, value)
+        return self.apply_settings({"focus": value})["focus"]
 
     def apply_settings(self, values) -> dict:
         if self._cap is None:
