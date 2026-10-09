@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import tempfile
 import time
@@ -47,6 +48,7 @@ class ShootingProfile:
     focus_readback: Optional[float] = None
     focus_verified: Optional[bool] = None
     saved_at: Optional[str] = None
+    fps: Optional[float] = None
 
     def problems(self) -> list:
         out = []
@@ -59,6 +61,9 @@ class ShootingProfile:
         f = self.focus_requested
         if f is None or isinstance(f, bool) or not isinstance(f, int) or not FOCUS_MIN <= f <= FOCUS_MAX:
             out.append("focus non défini ou hors plage")
+        if self.fps is not None and (isinstance(self.fps, bool) or not isinstance(self.fps, (int, float))
+                                     or not math.isfinite(self.fps) or not 0 < self.fps <= 120):
+            out.append("cadence hors plage")
         return out
 
     @property
@@ -69,7 +74,7 @@ class ShootingProfile:
         """Compare what the user chose; readbacks and timestamps are not user changes."""
         if other is None:
             return False
-        keys = ("camera_key", "camera_index", "path", "api", "focus_requested")
+        keys = ("camera_key", "camera_index", "path", "api", "focus_requested", "fps")
         return all(getattr(self, k) == getattr(other, k) for k in keys)
 
     def to_dict(self) -> dict:

@@ -1,6 +1,7 @@
 """Single camera worker: owns and serialises every camera operation.
 
-States (guarded by a lock): idle -> opening -> preview -> closing -> idle, and idle -> capturing -> idle.
+States (guarded by a lock): idle -> opening -> preview -> closing -> idle,
+and idle -> capturing / processing / probing -> idle.
 Preview and capture can never hold the camera together: capture requires ``idle`` and preview
 opening requires ``idle``. Events go to ``listener(event, **payload)`` from the worker thread;
 a UI must marshal them (Qt queued signal). Frame notifications are bounded: at most one is
@@ -34,6 +35,7 @@ from .preview import PreviewSession, probe_cameras
 log = logging.getLogger("arducam_photo")
 
 IDLE, OPENING, PREVIEW, CLOSING, CAPTURING = "idle", "opening", "preview", "closing", "capturing"
+PROCESSING = "processing"
 THUMB_MAX = 1280
 
 
@@ -57,6 +59,26 @@ def _thumbnail(image: np.ndarray) -> np.ndarray:
     return cv2.resize(image, (max(1, round(w * s)), max(1, round(h * s))), interpolation=cv2.INTER_AREA)
 
 
+def _detach_error(error):
+    """Queued errors must not retain full-resolution arrays through traceback frames."""
+    seen = set()
+    pending = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        current.__traceback__ = None
+        pending.extend(e for e in (current.__cause__, current.__context__) if e is not None)
+    return error
+
+
+def _persist_timings(path, timings, output_path=None):
+    from ..archive import update_timings
+
+    update_timings(path, dict(timings), output_path=output_path)
+
+
 class CameraController:
     def __init__(self, listener: Optional[Callable] = None, *, opener: Optional[Callable] = None,
                  capture_fn: Optional[Callable] = None, save_fn: Optional[Callable] = None,
@@ -65,6 +87,15 @@ class CameraController:
         self._opener = opener
         self._capture_fn = capture_fn or engine.capture
         self._save_fn = save_fn or save_png
+        self.legacy_capture = capture_fn is not None or save_fn is not None
+        self._processed = None
+        self._processed_manifest = None
+        self._processed_recipe = None
+        self._processed_ccm = None
+        self._processed_timings = {}
+        self._source_path = None
+        self._source_hash = None
+        self.camera_fault = None
         self._clock = clock
         self._q: "queue.Queue" = queue.Queue()
         self._lock = threading.Lock()
@@ -84,13 +115,33 @@ class CameraController:
 
     @property
     def camera_in_use(self) -> bool:
-        return self._state != IDLE
+        return self._state not in (IDLE, PROCESSING)
 
     @property
     def can_change_mode(self) -> bool:
-        return self._state != CAPTURING and self._state not in (OPENING, CLOSING)
+        return self._state in (IDLE, PREVIEW)
+
+    def load_acquisition(self, path: str) -> None:
+        self._transition(IDLE, PROCESSING, "chargement impossible (état %s)")
+        self._emit("processing_busy")
+        self._submit(("load", path))
+
+    def process(self, path: str, recipe, ccm_path=None) -> None:
+        self._transition(IDLE, PROCESSING, "traitement impossible (état %s)")
+        self._emit("processing_busy")
+        self._submit(("process", path, recipe, ccm_path))
+
+    def save_processed(self, options) -> None:
+        self._transition(IDLE, PROCESSING, "enregistrement impossible (état %s)")
+        self._emit("processing_busy")
+        self._submit(("save_processed", options))
+
+    def clear_processed(self) -> None:
+        self._submit(("clear_processed",))
 
     def open_preview(self, camera_index: int, api: str, path: str) -> None:
+        if self.camera_fault:
+            raise ModeError(f"redémarrage requis après échec de libération : {self.camera_fault}")
         self._transition(IDLE, OPENING, "le preview ne peut pas démarrer (état %s)")
         self._submit(("open", camera_index, api, path))
 
@@ -109,6 +160,8 @@ class CameraController:
     def capture(self, job: CaptureJob) -> None:
         """Reserve the camera synchronously (double trigger refused) and run on the worker."""
         with self._lock:
+            if self.camera_fault:
+                raise ModeError(f"redémarrage requis après échec de libération : {self.camera_fault}")
             if self._state == CAPTURING:
                 raise CaptureBusyError("une capture est déjà en cours")
             if self._state != IDLE:
@@ -121,7 +174,9 @@ class CameraController:
         self._submit(("ccm", path))
 
     def probe(self, max_index: int = 5, api: str = "msmf") -> None:
-        self._transition(IDLE, IDLE, "détection impossible (état %s)")
+        if self.camera_fault:
+            raise ModeError("redémarrage requis avant de détecter les caméras")
+        self._transition(IDLE, "probing", "détection impossible (état %s)")
         self._submit(("probe", max_index, api))
 
     def take_frame(self) -> Optional[np.ndarray]:
@@ -195,6 +250,7 @@ class CameraController:
                     break
                 self._handle(cmd)
         finally:
+            self._processed = None
             if self._session is not None:
                 self._session.close()
                 self._session = None
@@ -202,6 +258,7 @@ class CameraController:
     def _handle(self, cmd) -> None:
         kind = cmd[0]
         if kind == "open":
+            self._processed = None
             self._do_open(*cmd[1:])
         elif kind == "close":
             self._do_close()
@@ -209,6 +266,13 @@ class CameraController:
             self._do_focus(cmd[1])
         elif kind == "capture":
             self._do_capture(cmd[1])
+        elif kind in ("load", "process", "save_processed"):
+            self._do_processing(cmd)
+        elif kind == "clear_processed":
+            self._processed = None
+            self._processed_manifest = self._processed_recipe = None
+            self._processed_ccm = None
+            self._processed_timings = {}
         elif kind == "ccm":
             try:
                 load_ccm_file(cmd[1])
@@ -216,7 +280,15 @@ class CameraController:
             except Exception as e:
                 self._emit("ccm_checked", path=cmd[1], ok=False, error=e)
         elif kind == "probe":
-            self._emit("cameras", indices=probe_cameras(cmd[1], cmd[2], self._opener))
+            try:
+                indices = probe_cameras(cmd[1], cmd[2], self._opener)
+            except Exception as e:
+                self._set_state(IDLE)
+                self._emit("cameras_failed", error=_detach_error(e))
+                return
+            finally:
+                self._set_state(IDLE)
+            self._emit("cameras", indices=indices)
 
     def _do_open(self, index, api, path) -> None:
         session = PreviewSession(index, api, path, self._opener)
@@ -235,6 +307,9 @@ class CameraController:
         if self._session is not None:
             self._session.close()  # camera released before the event is sent
             self._session = None
+            if engine._release_failure:
+                self.camera_fault = engine._release_failure
+                self._emit("preview_release_failed", error=CaptureError(self.camera_fault))
         self.clear_frame()
         self._set_state(IDLE)
         self._emit("preview_closed")
@@ -265,6 +340,9 @@ class CameraController:
             self._emit("frame")
 
     def _do_capture(self, job: CaptureJob) -> None:
+        if not self.legacy_capture:
+            self._do_archived_capture(job)
+            return
         try:
             self._emit("capture_step", step="Préparation et vérification du profil")
             cfg = job.config
@@ -286,3 +364,140 @@ class CameraController:
         finally:
             self._set_state(IDLE)  # the engine has released the camera in every case
             self._emit("capture_idle")
+
+    def _do_archived_capture(self, job: CaptureJob) -> None:
+        from ..archive import (archive_acquisition, save_output, record_error, OutputOptions,
+                               snapshot_ccm)
+        from ..processing import ProcessingRecipe, process_image
+
+        manifest, stage = None, "acquisition"
+        timings = {}
+        started = t = self._clock()
+        self._processed = None
+        try:
+            self._emit("capture_step", step="Acquisition de l’original")
+            acquisition = engine.acquire(job.config, cancel_event=self._cancel, _opener=self._opener)
+            timings["acquisition_s"] = self._clock() - started
+            stage = "archive"
+            release_error = getattr(acquisition.info, "release_error", None)
+            if release_error:
+                self.camera_fault = release_error
+            self._emit("capture_step", step="Archivage de l’original"
+                       + (" · libération caméra échouée" if release_error else " · caméra libérée"))
+            t = self._clock()
+            manifest = archive_acquisition(acquisition, job.photo_dir)
+            timings["archive_s"] = self._clock() - t
+            timings["total_until_archive_s"] = self._clock() - started
+            self._emit("capture_archived", path=manifest, info=acquisition.info, timings=dict(timings))
+            _persist_timings(manifest, timings)
+            if release_error:
+                stage = "release"
+                raise CaptureError(release_error)
+            stage = "render"
+            self._emit("capture_step", step="Rendu de la photo")
+            raw = job.config.path == NATIVE_108MP
+            recipe = ProcessingRecipe(name="reference", apply_ccm=raw and job.config.apply_ccm)
+            t = self._clock()
+            ccm = (snapshot_ccm(job.config.ccm_path, recipe.temperature) if recipe.apply_ccm
+                   else {"requested": False})
+            image = process_image(acquisition.original, recipe, raw=raw, ccm_path=job.config.ccm_path,
+                                  ccm_entries=ccm.get("entries"))
+            info = dataclasses.replace(acquisition.info, ccm_requested=recipe.apply_ccm,
+                                       ccm_applied=recipe.apply_ccm,
+                                       ccm_path=ccm.get("path") if recipe.apply_ccm else None)
+            del acquisition
+            timings["render_s"] = self._clock() - t
+            stage = "output"
+            self._emit("capture_step", step="Enregistrement du PNG")
+            t = self._clock()
+            path = save_output(image, manifest, recipe, OutputOptions(), ccm_provenance=ccm,
+                               timings=timings)
+            timings["output_s"] = self._clock() - t
+            timings["total_until_output_s"] = self._clock() - started
+
+            _persist_timings(manifest, timings, output_path=path)
+            info = dataclasses.replace(info, duration_s=self._clock() - started,
+                                       timings={**info.timings, **timings})
+            h, w = image.shape[:2]
+            thumb = _thumbnail(image)
+            del image
+            self._emit("capture_done", path=path, thumbnail=thumb, info=info, size=(w, h),
+                       manifest_path=manifest, timings=timings)
+        except Exception as e:
+            if stage in ("acquisition", "archive", "render", "output"):
+                timings[f"{stage}_s"] = self._clock() - t
+            timings["total_until_failure_s"] = self._clock() - started
+            if manifest:
+                try:
+                    _persist_timings(manifest, timings)
+                    record_error(manifest, stage, e)
+                except Exception:
+                    log.exception("could not record archive error")
+            self._emit("capture_failed", error=_detach_error(e), recoverable=True, archive_path=manifest,
+                       stage=stage, timings=timings)
+        finally:
+            self._set_state(IDLE)
+            self._emit("capture_idle")
+
+    def _do_processing(self, cmd) -> None:
+        from ..archive import load_acquisition, save_output, record_error, snapshot_ccm
+        from ..processing import ProcessingRecipe, process_image
+
+        kind, manifest = cmd[0], None
+        started = self._clock()
+        phase_started = started
+        try:
+            if kind == "save_processed":
+                if self._processed is None:
+                    raise ModeError("aucun résultat traité à enregistrer")
+                manifest = self._processed_manifest
+                path = save_output(self._processed, manifest, self._processed_recipe, cmd[1],
+                                   ccm_provenance=self._processed_ccm,
+                                   timings=self._processed_timings)
+                self._emit("processing_saved", path=path)
+            else:
+                phase_started = self._clock()
+                self._processed = None
+                self._processed_manifest = self._processed_recipe = None
+                self._processed_ccm = None
+                self._processed_timings = {}
+                loaded = load_acquisition(cmd[1])
+                manifest = loaded.manifest_path
+                files = loaded.metadata.get("files", {})
+                source_hash = (files.get("original") or files.get("source") or {}).get("sha256")
+                if kind == "process" and self._source_path == cmd[1] and self._source_hash != source_hash:
+                    raise ModeError("la source a changé : ouvrez-la à nouveau avant de comparer")
+                if kind == "load":
+                    reference = ProcessingRecipe(name="minimal", apply_ccm=False)
+                    image = process_image(loaded.original, reference, raw=loaded.raw)
+                    thumb = _thumbnail(image)
+                    h, w = image.shape[:2]
+                    del image
+                    self._source_path, self._source_hash = cmd[1], source_hash
+                    self._emit("processing_loaded", path=cmd[1], manifest_path=manifest,
+                               thumbnail=thumb, raw=loaded.raw, metadata=loaded.metadata, size=(w, h))
+                else:
+                    self._processed_ccm = (snapshot_ccm(cmd[3], cmd[2].temperature)
+                                           if loaded.raw and cmd[2].name == "reference" and cmd[2].apply_ccm
+                                           else {"requested": False})
+                    self._processed = process_image(loaded.original, cmd[2], raw=loaded.raw,
+                                                    ccm_path=cmd[3], ccm_entries=self._processed_ccm.get("entries"))
+                    self._processed_manifest, self._processed_recipe = manifest or loaded.metadata, cmd[2]
+                    self._processed_timings = {"render_s": self._clock() - phase_started,
+                                              "load_process_s": self._clock() - started}
+                    h, w = self._processed.shape[:2]
+                    self._emit("processing_done", thumbnail=_thumbnail(self._processed), size=(w, h),
+                               recipe=self._processed_recipe)
+                del loaded
+        except Exception as e:
+            if isinstance(manifest, str):
+                try:
+                    if kind == "process":
+                        _persist_timings(manifest, {"render_s": self._clock() - phase_started})
+                    record_error(manifest, kind, e)
+                except Exception:
+                    log.exception("could not record processing error")
+            self._emit("processing_failed", error=_detach_error(e))
+        finally:
+            self._set_state(IDLE)
+            self._emit("processing_idle", duration_s=self._clock() - started)

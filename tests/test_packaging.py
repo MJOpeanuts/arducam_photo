@@ -80,6 +80,12 @@ def test_installed_resources_resolve_outside_source_tree(wheel, tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_wheel_includes_offline_processing_modules(wheel):
+    with ZipFile(wheel) as archive:
+        for module in ("archive.py", "processing.py", "storage.py"):
+            assert f"arducam_photo/{module}" in archive.namelist()
+
+
 def evaluate_spec(root):
     calls = {}
 

@@ -11,14 +11,32 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from ..config import NATIVE_108MP, SettingReport
+from .. import engine
+from ..config import PATHS, SettingReport
 from ..engine import _import_cv2, _open_video_capture
-from ..errors import CameraOpenError, CameraSetupError
+from ..errors import CameraOpenError, CameraSetupError, CaptureBusyError
 
 log = logging.getLogger("arducam_photo")
 
 PREVIEW_W, PREVIEW_H = 1280, 720
-PREVIEW_FPS = {NATIVE_108MP: 30, "color_720p": 10}  # starting points, "if available"
+PREVIEW_FPS = {path: 10 for path in PATHS}  # framing only; never promises full photo FoV
+
+
+def _claim_camera():
+    if not engine._busy.acquire(blocking=False):
+        raise CaptureBusyError("another camera acquisition or preview is already running")
+    if engine._release_failure is not None:
+        engine._busy.release()
+        raise CameraSetupError(f"previous camera release failed; restart required: {engine._release_failure}")
+
+
+def _release_camera(cap):
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception as error:
+            engine._release_failure = f"camera release failed: {error}"
+            log.exception("release failed")
 
 
 class PreviewSession:
@@ -26,6 +44,7 @@ class PreviewSession:
         self.camera_index, self.api, self.path = camera_index, api, path
         self._opener = opener or _open_video_capture
         self._cap = None
+        self._owns_camera = False
         self.settings: dict = {}
         self.failed_reads = 0
 
@@ -34,8 +53,11 @@ class PreviewSession:
         return self._cap is not None
 
     def open(self) -> dict:
-        cap = self._opener(self.camera_index, self.api)
+        _claim_camera()
+        self._owns_camera = True
+        cap = None
         try:
+            cap = self._opener(self.camera_index, self.api)
             if cap is None or not cap.isOpened():
                 raise CameraOpenError(
                     f"impossible d'ouvrir la caméra (index {self.camera_index}, {self.api}); "
@@ -48,10 +70,10 @@ class PreviewSession:
         except BaseException:
             self._cap = None
             try:
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                log.exception("release failed")
+                _release_camera(cap)
+            finally:
+                self._owns_camera = False
+                engine._busy.release()
             raise
         return self.settings
 
@@ -86,29 +108,32 @@ class PreviewSession:
 
     def close(self) -> None:
         cap, self._cap = self._cap, None
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                log.exception("release failed")
+        try:
+            _release_camera(cap)
+        finally:
+            if self._owns_camera:
+                self._owns_camera = False
+                engine._busy.release()
 
 
 def probe_cameras(max_index: int = 5, api: str = "msmf", opener: Optional[Callable] = None) -> list:
     """Indices that open. Opens then releases each index: only on explicit user request."""
     opener = opener or _open_video_capture
     found = []
-    for i in range(max_index + 1):
-        cap = None
-        try:
-            cap = opener(i, api)
-            if cap is not None and cap.isOpened():
-                found.append(i)
-        except Exception:
-            log.exception("probe %d failed", i)
-        finally:
+    _claim_camera()
+    try:
+        for i in range(max_index + 1):
+            cap = None
             try:
-                if cap is not None:
-                    cap.release()
+                cap = opener(i, api)
+                if cap is not None and cap.isOpened():
+                    found.append(i)
             except Exception:
-                pass
+                log.exception("probe %d failed", i)
+            finally:
+                _release_camera(cap)
+            if engine._release_failure is not None:
+                raise CameraSetupError(engine._release_failure)
+    finally:
+        engine._busy.release()
     return found

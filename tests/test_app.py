@@ -415,3 +415,122 @@ def test_bundled_missing_or_invalid_reports_error(tmp_path, monkeypatch):
         assert "ERREUR" in e.model.ccm_status()
     finally:
         e.model.shutdown(5)
+
+
+def test_unsaved_preview_to_processing_requires_decision_and_releases(env):
+    from arducam_photo.app.model import PROCESSING_MODE
+    env.preview()
+    env.model.set_focus(222); env.wait("focus_applied")
+    with pytest.raises(NeedsDecision):
+        env.model.request_processing_mode()
+    assert not env.model.request_processing_mode(STAY)
+    assert env.model.request_processing_mode(SAVE)
+    env.wait("mode_changed", nth=2)
+    assert env.model.mode == PROCESSING_MODE
+    assert VideoCap.registry[0].released == 1
+    env.model.request_capture_mode()
+    assert env.model.mode == CAPTURE_MODE and len(VideoCap.registry) == 1
+
+
+def test_capture_mode_mismatch_requires_explicit_preview_save(env):
+    from arducam_photo.config import COLOR_4K, MODES
+    env.preview(); env.set_focus_and_save()
+    to_capture(env)
+    env.model.select_path(COLOR_4K)
+    assert "non applicable (4K couleur)" in env.model.ccm_status()
+    with pytest.raises(ProfileMissing, match="mode différent"):
+        env.model.trigger()
+    env.model.enter_preview(); env.wait("mode_changed", nth=3)
+    assert env.model.draft.path == COLOR_4K and env.model.draft.fps == MODES[COLOR_4K].fps
+    assert env.model.has_unsaved()
+    env.model.save_profile()
+    assert env.model.saved.path == COLOR_4K
+
+
+def test_old_profile_missing_fps_remains_unspecified_and_new_preview_adapts(env):
+    from arducam_photo.config import MODES
+    old = ShootingProfile.from_dict({"camera_key": "index:0", "focus_requested": 300})
+    assert old.fps is None
+    env.profiles.save(old)
+    env.model.request_capture_mode()
+    assert env.model.saved.fps is None
+    env.model.enter_preview(); env.wait("mode_changed", nth=2)
+    assert env.model.draft.fps == MODES[env.model.path].fps
+    assert env.model.has_unsaved()
+    env.model.set_fps(3)
+    env.model.save_profile()
+    assert env.profiles.load("index:0").fps == 3
+
+
+@pytest.mark.parametrize("fps", [0, float("nan"), True, "fast"])
+def test_invalid_photo_fps_does_not_change_draft(env, fps):
+    env.preview()
+    before = env.model.draft
+    with pytest.raises(CaptureConfigError):
+        env.model.set_fps(fps)
+    assert env.model.draft == before
+
+
+def test_preview_excludes_other_controllers_and_public_acquire(env):
+    from arducam_photo import engine
+    from arducam_photo.config import CaptureConfig, COLOR_720P
+    env.preview()
+    events = []
+    other = CameraController(lambda event, **kw: events.append((event, kw)),
+                             opener=lambda *a: pytest.fail("second controller opened a camera"))
+    try:
+        other.open_preview(0, "msmf", COLOR_720P)
+        for _ in range(100):
+            if events:
+                break
+            time.sleep(0.01)
+        assert events[0][0] == "preview_failed"
+        assert isinstance(events[0][1]["error"], CaptureBusyError)
+        with pytest.raises(CaptureBusyError):
+            engine.acquire(CaptureConfig(path=COLOR_720P, apply_ccm=False),
+                           _opener=lambda *a: pytest.fail("public acquisition opened during preview"))
+    finally:
+        assert other.shutdown(5)
+
+
+def test_preview_blocks_camera_probe(env):
+    from arducam_photo.app.preview import probe_cameras
+    env.preview()
+    with pytest.raises(CaptureBusyError):
+        probe_cameras(opener=lambda *a: pytest.fail("probe opened during preview"))
+
+
+def test_preview_open_exception_releases_global_camera_claim(monkeypatch):
+    from arducam_photo import engine
+    from arducam_photo.app.preview import PreviewSession
+    from arducam_photo.config import COLOR_720P
+
+    def fail(*a):
+        raise OSError("open test failure")
+
+    session = PreviewSession(0, "msmf", COLOR_720P, fail)
+    with pytest.raises(OSError):
+        session.open()
+    assert not engine._busy.locked()
+    session = PreviewSession(0, "msmf", COLOR_720P, lambda *a: VideoCap())
+    session.open()
+    assert engine._busy.locked()
+    session.close()
+    session.close()
+    assert not engine._busy.locked()
+
+
+def test_preview_and_probe_honor_global_release_quarantine(monkeypatch):
+    from arducam_photo import engine
+    from arducam_photo.app.preview import PreviewSession, probe_cameras
+    from arducam_photo.config import COLOR_720P
+    from arducam_photo.errors import CameraSetupError
+
+    monkeypatch.setattr(engine, "_release_failure", "unresolved camera handle")
+    opener = lambda *a: pytest.fail("opened a quarantined camera")
+    session = PreviewSession(0, "msmf", COLOR_720P, opener)
+    with pytest.raises(CameraSetupError, match="restart required"):
+        session.open()
+    with pytest.raises(CameraSetupError, match="restart required"):
+        probe_cameras(opener=opener)
+    assert not engine._busy.locked()

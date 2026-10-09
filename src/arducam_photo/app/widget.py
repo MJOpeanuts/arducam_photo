@@ -12,15 +12,16 @@ from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
+                               QStackedWidget, QTabBar, QToolButton, QVBoxLayout, QWidget)
 
-from ..config import COLOR_720P, NATIVE_108MP
+from ..config import PATHS, MODES
 from .controller import ModeError
 from .icons import bundled_pixmap, lucide_icon
-from .model import (CAPTURE_MODE, DISCARD, PATH_LABELS, PREVIEW_MODE, SAVE, START, STAY,
+from .model import (CAPTURE_MODE, PROCESSING_MODE, DISCARD, PATH_LABELS, PREVIEW_MODE, SAVE, START, STAY,
                     NeedsDecision, ProfileMissing, SessionModel)
 from .paths import open_in_system
 from .profile import FOCUS_MAX, FOCUS_MIN
+from .processing_widget import ProcessingWidget
 
 
 def bgr_to_qimage(frame: np.ndarray) -> QImage:
@@ -28,7 +29,7 @@ def bgr_to_qimage(frame: np.ndarray) -> QImage:
     array nor the intermediate RGB buffer needs to outlive this call."""
     import cv2
 
-    rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB if frame.ndim == 2 else cv2.COLOR_BGR2RGB))
     h, w = rgb.shape[:2]
     return QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
 
@@ -125,13 +126,15 @@ class CameraWidget(QWidget):
         # start page
         s = QWidget(); sl = QVBoxLayout(s)
         self.path_combo = QComboBox()
-        for k in (NATIVE_108MP, COLOR_720P):
+        for k in PATHS:
             self.path_combo.addItem(PATH_LABELS[k], k)
+            self.path_combo.setItemData(self.path_combo.count() - 1, MODES[k].description, Qt.ItemDataRole.ToolTipRole)
         self.path_combo.setCurrentIndex(self.path_combo.findData(self.model.path))
         self.path_combo.currentIndexChanged.connect(self._path_changed)
         self.cam_combo = QComboBox(); self._fill_cameras([self.model.camera.index])
         self.cam_combo.currentIndexChanged.connect(self._camera_changed)
         detect = QPushButton("Détecter les caméras (ouvre brièvement chaque index)")
+        self.detect_button = detect
         detect.clicked.connect(self._detect)
         self.usb_note = QLabel("Le parcours choisi n'est pas une mesure de la vitesse USB : "
                                "108 MP exige USB 3, 720p fonctionne en USB 2 ou 3 si le mode existe.")
@@ -176,6 +179,9 @@ class CameraWidget(QWidget):
         self.unsaved = QLabel(""); self.unsaved.setObjectName("muted")
         self.preview_msg = QLabel(""); self.preview_msg.setWordWrap(True); self.preview_msg.hide()
         self.btn_save = QPushButton("Enregistrer"); self.btn_save.clicked.connect(self._save)
+        self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 120)
+        self.fps_spin.setToolTip("Cadence photo demandée, sans garantie du pilote")
+        self.fps_spin.valueChanged.connect(lambda v: self._guard(self.model.set_fps, v))
         self.focus_slider.setAccessibleName("Focus manuel")
         self.focus_spin.setAccessibleName("Valeur du focus manuel")
         self.focus_slider.setToolTip("Régler la consigne du focus manuel")
@@ -189,10 +195,23 @@ class CameraWidget(QWidget):
         pl.addLayout(focus_row); pl.addWidget(self.preview_msg)
         self.preview_details = QLabel(); self.preview_details.setWordWrap(True)
         self._diagnostic(pl, "preview", (self.fps_label, self.focus_state, self.preview_details))
+        fps_row = QHBoxLayout(); fps_row.addWidget(QLabel("Cadence photo demandée")); fps_row.addWidget(self.fps_spin)
+        fps_row.addStretch()
+        self.preview_diagnostic.widget().layout().addLayout(fps_row)
         # capture page
         c = QWidget(); cl = QVBoxLayout(c)
         self.btn_c_preview = self._mode_button("Preview", self._go_preview)
         self._header(cl)
+        self.capture_mode_combo = QComboBox()
+        self.capture_mode_combo.setAccessibleName("Mode photo")
+        for path in PATHS:
+            self.capture_mode_combo.addItem(PATH_LABELS[path], path)
+            self.capture_mode_combo.setItemData(self.capture_mode_combo.count() - 1, MODES[path].description,
+                                               Qt.ItemDataRole.ToolTipRole)
+        self.capture_mode_combo.setCurrentIndex(self.capture_mode_combo.findData(self.model.path))
+        self.capture_mode_combo.currentIndexChanged.connect(self._capture_path_changed)
+        mode_row = QHBoxLayout(); mode_row.addWidget(QLabel("Mode photo")); mode_row.addWidget(self.capture_mode_combo)
+        mode_row.addStretch(); cl.addLayout(mode_row)
         self.profile_label = QLabel(); self.profile_label.setWordWrap(True)
         self.profile_label.setObjectName("muted")
         self.ccm_label2 = QLabel(); self.ccm_label2.setWordWrap(True)
@@ -211,6 +230,9 @@ class CameraWidget(QWidget):
         cl.addWidget(self.photo, 1)
         self.btn_open_dir = QPushButton("Ouvrir le dossier"); self.btn_open_dir.clicked.connect(self._open_dir)
         self.btn_open_last = QPushButton("Ouvrir la dernière photo"); self.btn_open_last.clicked.connect(self._open_last)
+        self.btn_process_last = QPushButton("Traiter la dernière acquisition")
+        self.btn_process_last.clicked.connect(self._process_last)
+        mode_row.addWidget(self.btn_process_last)
         for button in (self.btn_open_dir, self.btn_open_last):
             button.setFixedHeight(38)
             button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -225,9 +247,17 @@ class CameraWidget(QWidget):
         self.result_label.hide(); self.step_label.hide()
         self.capture_details = QLabel(); self.capture_details.setWordWrap(True)
         self._diagnostic(cl, "capture", (self.profile_label, self.ccm_label2, self.capture_details))
-        for page in (self.start_scroll, p, c):
+        self.processing = ProcessingWidget(self.model, self._guard)
+        for page in (self.start_scroll, p, c, self.processing):
             self.stack.addWidget(page)
-        lay = QVBoxLayout(self); lay.setContentsMargins(16, 12, 16, 12); lay.addWidget(self.stack, 1)
+        lay = QVBoxLayout(self); lay.setContentsMargins(16, 12, 16, 12)
+        self.tabs = QTabBar(); self.tabs.setExpanding(False)
+        for label in ("Preview", "Capture", "Traitement"):
+            self.tabs.addTab(label)
+        self.tabs.currentChanged.connect(self._navigate)
+        self.tabs.tabBarClicked.connect(
+            lambda index: self._navigate(index) if self.model.mode == START and not self.model.pending else None)
+        lay.addWidget(self.tabs); lay.addWidget(self.stack, 1)
         self.footer = ImageView()
         self.footer.setObjectName("footer")
         self.footer.setAccessibleName("powered by")
@@ -264,6 +294,7 @@ class CameraWidget(QWidget):
         toggle.setAccessibleName("Afficher ou masquer le diagnostic")
         toggle.setToolTip("Informations techniques et détails des erreurs")
         area = QScrollArea(); area.setWidgetResizable(True); area.setMaximumHeight(150)
+        area.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Ignored)
         content = QWidget(); inner = QVBoxLayout(content)
         for widget in widgets:
             widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -331,13 +362,25 @@ class CameraWidget(QWidget):
             box.setDetailedText(str(error)); box.exec()
 
     def _refresh_open_buttons(self):
-        self.btn_open_dir.setEnabled(os.path.isdir(self.model.photo_dir()))
+        directory = self._directory_to_open()
+        self.btn_open_dir.setEnabled(os.path.isdir(directory))
+        self.btn_open_dir.setToolTip(f"Ouvrir le dossier : {directory}")
         self.btn_open_last.setEnabled(bool(self.model.last_photo and os.path.isfile(self.model.last_photo)))
+        self.btn_process_last.setEnabled(bool(self.model.last_acquisition)
+                                         and self.model.controller.can_change_mode)
 
-    PAGES = {START: 0, PREVIEW_MODE: 1, CAPTURE_MODE: 2}
+    PAGES = {START: 0, PREVIEW_MODE: 1, CAPTURE_MODE: 2, PROCESSING_MODE: 3}
 
     def _show_page(self, mode: str) -> None:
         self.stack.setCurrentIndex(self.PAGES[mode])
+        self._set_capture_busy(not self.model.controller.can_change_mode)
+        self.tabs.blockSignals(True)
+        self.tabs.setCurrentIndex({PREVIEW_MODE: 0, CAPTURE_MODE: 1, PROCESSING_MODE: 2}.get(mode, -1))
+        self.tabs.blockSignals(False)
+        self.capture_mode_combo.blockSignals(True)
+        self.capture_mode_combo.setCurrentIndex(self.capture_mode_combo.findData(self.model.path))
+        self.capture_mode_combo.blockSignals(False)
+        self.processing.refresh()
         ccm_status = self.model.ccm_status()
         self.ccm_label.setText(ccm_status)
         self.ccm_label2.setText(ccm_status)
@@ -352,11 +395,10 @@ class CameraWidget(QWidget):
                     f"Focus {prof.focus_requested if prof.focus_requested is not None else '–'}")
             else:
                 self.profile_label.setText("Aucun profil valide : passez par Preview / Réglages.")
-            if ccm_status.startswith("Correction couleur : ERREUR"):
-                self.result_label.setText(
-                    "Correction couleur indisponible : capture 108 MP impossible. Voir Diagnostic.")
+            if prof and prof.path != self.model.path:
+                self.result_label.setText("Ce mode nécessite un nouveau profil enregistré explicitement en Preview.")
                 self.result_label.show()
-            elif self.result_label.text().startswith("Correction couleur indisponible"):
+            elif self.result_label.text().startswith("Ce mode nécessite"):
                 self.result_label.clear()
                 self.result_label.hide()
             self._set_capture_busy(self.model.controller.state == "capturing")
@@ -393,12 +435,42 @@ class CameraWidget(QWidget):
         self._guard(self.model.select_path, self.path_combo.currentData())
         self.ccm_label.setText(self.model.ccm_status())
 
+    def _capture_path_changed(self, _):
+        self._guard(self.model.select_path, self.capture_mode_combo.currentData())
+        self._show_page(self.model.mode)
+
+    def _navigate(self, index):
+        {0: self._go_preview, 1: self._go_capture, 2: self._go_processing}.get(index, lambda: None)()
+        self.tabs.blockSignals(True)
+        self.tabs.setCurrentIndex({PREVIEW_MODE: 0, CAPTURE_MODE: 1, PROCESSING_MODE: 2}.get(self.model.mode, -1))
+        self.tabs.blockSignals(False)
+
+    def _go_processing(self):
+        decision = None
+        while True:
+            try:
+                self.model.request_processing_mode(decision)
+                if self.model.pending:
+                    self._set_capture_busy(True)
+                return
+            except NeedsDecision:
+                decision = self._ask_unsaved()
+            except Exception as e:
+                self._error("Impossible de passer en Traitement.", e)
+                return
+
+    def _process_last(self):
+        self._go_processing()
+        if self.model.mode == PROCESSING_MODE and self.model.last_acquisition:
+            self.processing._load(self.model.last_acquisition)
+
     def _camera_changed(self, _):
         if self.cam_combo.currentData() is not None:
             self._guard(self.model.select_camera, self.cam_combo.currentData())
 
     def _detect(self):
         self._guard(self.model.controller.probe)
+        self._set_capture_busy(not self.model.controller.can_change_mode)
 
     def _pick_ccm(self):
         f, _ = QFileDialog.getOpenFileName(self, "arducam_108mp.json", "", "JSON (*.json)")
@@ -417,12 +489,16 @@ class CameraWidget(QWidget):
         if self.model.mode == PREVIEW_MODE:
             return
         self._guard(self.model.enter_preview)
+        if self.model.pending:
+            self._set_capture_busy(True)
 
     def _go_capture(self):
         decision = None
         while True:
             try:
                 self.model.request_capture_mode(decision)
+                if self.model.pending:
+                    self._set_capture_busy(True)
                 return
             except NeedsDecision:
                 decision = self._ask_unsaved()
@@ -474,18 +550,27 @@ class CameraWidget(QWidget):
 
     def _set_capture_busy(self, busy: bool) -> None:
         for b in (self.btn_trigger, self.btn_c_preview, self.btn_p_capture,
-                  self.btn_to_capture, self.btn_to_preview):
+                  self.btn_to_capture, self.btn_to_preview, self.capture_mode_combo, self.tabs,
+                  self.btn_process_last, self.path_combo, self.cam_combo, self.detect_button):
             b.setEnabled(not busy)
         if not busy:
             prof = self.model.saved
-            self.btn_trigger.setEnabled(bool(prof and prof.is_valid))
+            self.btn_trigger.setEnabled(bool(prof and prof.is_valid and prof.path == self.model.path)
+                                        and not self.model.controller.camera_fault)
             self._refresh_open_buttons()
 
     def _open_dir(self):
-        d = self.model.photo_dir()
+        d = self._directory_to_open()
         if os.path.isdir(d):
             self._guard(open_in_system, d)
         self._refresh_open_buttons()
+
+    def _directory_to_open(self):
+        if self.model.last_acquisition:
+            directory = os.path.dirname(self.model.last_acquisition)
+            if os.path.isdir(directory):
+                return directory
+        return self.model.photo_dir()
 
     def _open_last(self):
         if self.model.last_photo and os.path.isfile(self.model.last_photo):
@@ -511,6 +596,7 @@ class CameraWidget(QWidget):
         elif event == "mode_changed":
             self._show_page(kw["mode"])
         elif event == "preview_failed":
+            self._set_capture_busy(False)
             self._error("Impossible d’ouvrir la caméra.", kw["error"])
         elif event == "preview_warning":
             self._technical["Lectures échouées"] = kw["failed_reads"]
@@ -521,6 +607,10 @@ class CameraWidget(QWidget):
             self._refresh_preview_state(kw)
         elif event == "cameras":
             self._fill_cameras(kw["indices"] or [self.model.camera.index])
+            self._set_capture_busy(False)
+        elif event in ("cameras_failed", "preview_release_failed"):
+            self._set_capture_busy(False)
+            self._error("Caméra indisponible · voir Diagnostic.", kw["error"])
         elif event == "ccm_checked":
             if not kw["ok"]:
                 self._error("Fichier de correction couleur invalide.", kw["error"])
@@ -552,12 +642,29 @@ class CameraWidget(QWidget):
                 "Dernier fichier": kw["path"], "Dimensions": f"{w} × {h}",
                 "Correction couleur appliquée": str(info.ccm_applied),
                 "Durée du moteur": f"{info.duration_s:.1f} s",
+                "Chronométrage détaillé": str(kw.get("timings", {})),
             })
             self._technical.pop("Erreur technique", None)
             self._refresh_diagnostic()
             self._refresh_open_buttons()
         elif event == "capture_failed":
-            self._error("Échec de la capture.", kw["error"])
+            self._technical["Chronométrage détaillé"] = str(kw.get("timings", {}))
+            archive = kw.get("archive_path")
+            self._error("Capture incomplète · original archivé disponible en Traitement."
+                        if archive else "Échec de la capture · aucun nouvel original archivé.", kw["error"])
+        elif event == "capture_archived":
+            self._technical["Archive de l’original"] = kw["path"]
+            self._technical["Chronométrage détaillé"] = str(kw.get("timings", {}))
+            self._refresh_open_buttons()
+        elif event.startswith("processing_"):
+            self.processing.on_event(event, kw)
+            if event == "processing_busy":
+                self.processing.busy = True
+                self.processing.refresh()
+                self._set_capture_busy(True)
+            elif event == "processing_idle":
+                self._set_capture_busy(False)
+                self._technical["Durée traitement"] = f"{kw['duration_s']:.2f} s"
         elif event == "capture_idle":
             self.step_label.setText("")
             self.step_label.hide()
@@ -568,6 +675,10 @@ class CameraWidget(QWidget):
         if d is None:
             return
         self._sync_focus_controls(d.focus_requested)
+        self.fps_spin.blockSignals(True)
+        self.fps_spin.setValue(round(d.fps or MODES[d.path].fps))
+        self.fps_spin.blockSignals(False)
+        self._technical["Aperçu de cadrage"] = "720p à cadence modeste; champ photo complet non garanti"
         rb = "–" if d.focus_readback is None else f"{d.focus_readback:g}"
         req = "–" if d.focus_requested is None else str(d.focus_requested)
         self.focus_state.setText(f"Focus manuel : consigne {req} | valeur relue {rb} "
@@ -586,8 +697,8 @@ class CameraWidget(QWidget):
     # ---- closing ----
     def can_close(self) -> bool:
         """False if the window must stay open (capture running, or user stays in Preview)."""
-        if self.model.controller.state == "capturing":
-            self._info("Une capture est en cours : attendez la fin avant de fermer.")
+        if self.model.controller.state in ("capturing", "processing"):
+            self._info("Une opération est en cours : attendez la fin avant de fermer.")
             return False
         if self.model.has_unsaved():
             d = self._ask_unsaved()

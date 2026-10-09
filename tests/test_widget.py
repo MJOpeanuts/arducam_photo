@@ -39,6 +39,13 @@ def test_qimage_owns_pixels_after_source_freed(qapp):
     assert (c.red(), c.green(), c.blue()) == (200, 0, 0) and img.width() == 30 and len(junk) == 50
 
 
+def test_grayscale_processing_qimage_owns_pixels(qapp):
+    source = np.full((12, 20), 83, np.uint8)
+    image = bgr_to_qimage(source)
+    source[:] = 0
+    assert image.pixelColor(3, 3).red() == 83
+
+
 def test_widget_start_has_no_camera_and_closes_cleanly(qapp, tmp_path):
     opened = []
     model = SessionModel(JsonProfileStore(str(tmp_path / "p.json")), JsonSettingsStore(str(tmp_path / "s.json")),
@@ -76,6 +83,157 @@ def show_mode(w, mode, qapp):
     w.model.controller._state = "preview" if mode == PREVIEW_MODE else "idle"
     w._show_page(mode)
     qapp.processEvents()
+
+
+def test_three_tabs_and_explicit_four_mode_selector(widget, qapp):
+    from arducam_photo.config import PATHS, COLOR_4K
+    show_mode(widget, CAPTURE_MODE, qapp)
+    assert [widget.tabs.tabText(i) for i in range(widget.tabs.count())] == ["Preview", "Capture", "Traitement"]
+    assert widget.capture_mode_combo.count() == len(PATHS) == 4
+    widget.capture_mode_combo.setCurrentIndex(widget.capture_mode_combo.findData(COLOR_4K))
+    assert widget.model.path == COLOR_4K
+    assert not widget.btn_trigger.isEnabled()
+    widget._set_capture_busy(True)
+    assert not widget.tabs.isEnabled() and not widget.capture_mode_combo.isEnabled()
+    widget._set_capture_busy(False)
+    assert widget.tabs.isEnabled()
+
+
+def test_processing_comparison_thumbnails_normalized_and_synchronized(widget, qapp):
+    from arducam_photo.app.model import PROCESSING_MODE
+    show_mode(widget, PROCESSING_MODE, qapp)
+    panel = widget.processing
+    panel.on_event("processing_loaded", {"thumbnail": np.zeros((240, 320, 3), np.uint8),
+                                        "raw": True, "path": "acquisition.json", "size": (12000, 9000)})
+    panel.on_event("processing_done", {"thumbnail": np.zeros((120, 160), np.uint8), "size": (800, 600)})
+    assert "dématricé minimal" in panel.source_label.text()
+    assert panel.source.sceneRect().size() == panel.result.sceneRect().size()
+    panel.source.scale(1.5, 1.5)
+    panel.source._changed()
+    assert panel.source.transform() == panel.result.transform()
+    assert panel.has_result and panel.save_button.isEnabled()
+    panel.on_event("processing_busy", {})
+    widget._on_event("processing_busy", {})
+    assert not widget.tabs.isEnabled() and not panel.save_button.isEnabled()
+    widget._on_event("processing_idle", {"duration_s": 0.1})
+    assert widget.tabs.isEnabled()
+
+
+def test_processing_navigation_respects_unsaved_preview(widget, qapp, monkeypatch):
+    show_mode(widget, PREVIEW_MODE, qapp)
+    widget.model.draft = dataclasses.replace(widget.model.saved, focus_requested=301)
+    monkeypatch.setattr(widget, "_ask_unsaved", lambda: "stay")
+    widget._go_processing()
+    assert widget.model.mode == PREVIEW_MODE and widget.model.has_unsaved()
+
+
+def test_processing_raw_controls_and_reference_defaults(widget, qapp):
+    panel = widget.processing
+    loaded = {"thumbnail": np.zeros((120, 160, 3), np.uint8), "path": "source.json", "size": (160, 120)}
+    panel.on_event("processing_loaded", {**loaded, "raw": True})
+    assert panel.recipe().name == "reference" and panel.recipe().apply_ccm
+    assert panel.recipe().black_level == 16 and panel.recipe().temperature == 4000
+    assert panel.recipe_combo.isEnabled() and panel.black.isEnabled()
+    panel.on_event("processing_loaded", {**loaded, "raw": False})
+    assert not panel.recipe_combo.isEnabled() and not panel.black.isEnabled() and not panel.colour.isEnabled()
+    assert not panel.recipe().apply_ccm
+
+
+def test_processing_recipe_changes_disable_stale_save(widget, qapp):
+    panel = widget.processing
+    loaded = {"thumbnail": np.zeros((120, 160, 3), np.uint8), "raw": False,
+              "path": "source.png", "size": (160, 120)}
+    panel.on_event("processing_loaded", loaded)
+    panel.on_event("processing_done", {"thumbnail": loaded["thumbnail"], "size": (160, 120),
+                                       "recipe": panel.recipe()})
+    assert panel.save_button.isEnabled()
+    panel.gray.setChecked(True)
+    assert not panel.save_button.isEnabled()
+    assert "non appliqués" in panel.status.text()
+    panel.on_event("processing_done", {"thumbnail": loaded["thumbnail"], "size": (160, 120),
+                                       "recipe": panel.recipe()})
+    assert panel.save_button.isEnabled()
+    panel.on_event("processing_cleared", {})
+    assert not panel.has_result and not panel.save_button.isEnabled()
+    assert panel.result.scene().items() == []
+    assert "libéré" in panel.status.text()
+
+
+def test_comparison_sync_uses_relative_zoom_and_center_for_different_viewports(qapp):
+    from arducam_photo.app.processing_widget import ComparisonView
+    source, result = ComparisonView(), ComparisonView()
+    source.resize(500, 300); result.resize(300, 200)
+    source.changed.connect(result.synchronize)
+    result.changed.connect(source.synchronize)
+    source.show(); result.show()
+    qapp.processEvents()
+    try:
+        source.set_image(np.zeros((180, 320, 3), np.uint8))
+        result.set_image(np.zeros((90, 160, 3), np.uint8))
+        source.scale(2, 2)
+        source.centerOn(source.sceneRect().center())
+        source._changed()
+        qapp.processEvents()
+
+        def relative(view):
+            rect = view.sceneRect()
+            center = view.mapToScene(view.viewport().rect().center())
+            fit = min(view.viewport().width() / rect.width(), view.viewport().height() / rect.height())
+            return view.transform().m11() / fit, center.x() / rect.width(), center.y() / rect.height()
+
+        assert relative(source) == pytest.approx(relative(result), abs=0.01)
+        assert source.transform() != result.transform()
+    finally:
+        source.close(); result.close()
+
+
+@pytest.mark.parametrize("size", [(1280, 720), (838, 400)])
+def test_processing_controls_fit_with_advanced_collapsed(widget, qapp, size):
+    from arducam_photo.app.model import PROCESSING_MODE
+    widget.resize(*size)
+    show_mode(widget, PROCESSING_MODE, qapp)
+    panel = widget.processing
+    panel.on_event("processing_loaded", {"thumbnail": np.zeros((120, 160, 3), np.uint8),
+                                        "raw": True, "path": "source.json", "size": (12000, 9000)})
+    qapp.processEvents()
+    assert (widget.width(), widget.height()) == size
+    for control in (panel.open_button, panel.source, panel.result, panel.process_button, panel.save_button, panel.status):
+        top = control.mapTo(widget, control.rect().topLeft())
+        assert top.x() >= 0 and top.y() >= 0
+        assert top.x() + control.width() <= widget.width()
+        assert top.y() + control.height() <= widget.footer.geometry().top()
+
+
+@pytest.mark.parametrize("size", [(1280, 720), (838, 400)])
+def test_processing_advanced_controls_scroll_without_enlarging_window(widget, qapp, size):
+    from arducam_photo.app.model import PROCESSING_MODE
+    widget.resize(*size)
+    show_mode(widget, PROCESSING_MODE, qapp)
+    panel = widget.processing
+    panel.advanced_toggle.setChecked(True)
+    qapp.processEvents()
+    assert (widget.width(), widget.height()) == size
+    assert panel.advanced_widget.isVisible()
+    assert panel.control_scroll.geometry().bottom() < panel.status.geometry().top()
+    panel.control_scroll.ensureWidgetVisible(panel.adaptive_c)
+    qapp.processEvents()
+    top = panel.save_button.mapTo(widget, panel.save_button.rect().topLeft())
+    assert top.y() + panel.save_button.height() <= widget.footer.geometry().top()
+
+
+def test_archive_render_failure_keeps_last_capture_image(widget, qapp):
+    show_mode(widget, CAPTURE_MODE, qapp)
+    widget._on_event("capture_done", {"thumbnail": np.full((90, 120, 3), 99, np.uint8),
+                                     "path": "last.png", "size": (120, 90),
+                                     "info": SimpleNamespace(ccm_applied=False, duration_s=0.1)})
+    previous = widget.photo.source.toImage()
+    widget._on_event("capture_failed", {"error": OSError("CCM missing"), "archive_path": "acquisition.json",
+                                        "timings": {"render_s": 0.25}})
+    assert widget.photo.source.toImage() == previous
+    assert "original archivé disponible" in widget.result_label.text()
+    assert "render_s" in widget.capture_details.text() and "0.25" in widget.capture_details.text()
+    widget._on_event("capture_failed", {"error": OSError("disk full"), "archive_path": None})
+    assert "aucun nouvel original archivé" in widget.result_label.text()
 
 
 def test_save_status_is_unique_and_focus_restored(widget, qapp):
@@ -215,6 +373,21 @@ def test_diagnostic_fullscreen_and_persistent_preference(window, qapp):
         fresh.shutdown()
     widget._startup_controls[1].setChecked(False)
     assert not settings.load().start_fullscreen
+
+
+def test_processing_uses_same_global_fullscreen(window, qapp):
+    from arducam_photo.app.model import PROCESSING_MODE
+    show_mode(window.widget, PROCESSING_MODE, qapp)
+    before = window.geometry()
+    source = window.widget.processing.source
+    source.setFocus()
+    QTest.keyClick(source, Qt.Key.Key_F11)
+    qapp.processEvents()
+    assert window.isFullScreen() and window.widget.footer.isVisible()
+    assert window.widget.model.mode == PROCESSING_MODE and window.widget.model.controller.state == "idle"
+    QTest.keyClick(source, Qt.Key.Key_Escape)
+    qapp.processEvents()
+    assert not window.isFullScreen() and window.geometry() == before
 
 
 def test_quit_uses_existing_guards(window, qapp, monkeypatch):
@@ -385,6 +558,32 @@ def test_capture_busy_failure_and_opening_availability(widget, qapp, tmp_path):
     assert widget.btn_open_last.isEnabled()
     assert "technical-test-details" not in widget.result_label.text()
     assert widget.btn_open_dir.height() == widget.btn_open_last.height()
+
+
+def test_open_directory_prefers_last_archive_even_when_render_failed(widget, qapp, tmp_path, monkeypatch):
+    import arducam_photo.app.widget as module
+    root = tmp_path / "photos"
+    archive_dir = root / "acquisition-id"
+    archive_dir.mkdir(parents=True)
+    manifest = archive_dir / "acquisition.json"
+    manifest.write_text("{}")
+    previous = root / "previous.png"
+    previous.write_bytes(b"test")
+    widget.model.set_photo_dir(str(root))
+    widget.model.last_acquisition = str(manifest)
+    widget.model.last_photo = str(previous)
+    opened = []
+    monkeypatch.setattr(module, "open_in_system", opened.append)
+    show_mode(widget, CAPTURE_MODE, qapp)
+    fixed_height = widget.btn_open_dir.height()
+    widget._on_event("capture_failed", {"error": OSError("render failure"), "archive_path": str(manifest)})
+    widget.btn_open_dir.click()
+    widget.btn_open_last.click()
+    assert opened == [str(archive_dir), str(previous)]
+    assert widget.btn_open_dir.height() == widget.btn_open_last.height() == fixed_height
+    widget.model.last_acquisition = str(root / "missing" / "acquisition.json")
+    widget._open_dir()
+    assert opened[-1] == str(root)
 
 
 def test_bundled_svg_icons(qapp):
