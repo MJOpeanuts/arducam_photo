@@ -47,6 +47,14 @@ class ShootingProfile:
     focus_requested: Optional[int] = None
     focus_readback: Optional[float] = None
     focus_verified: Optional[bool] = None
+    exposure: Optional[float] = None
+    auto_exposure: Optional[float] = None
+    gain: Optional[float] = None
+    auto_wb: Optional[float] = None
+    wb_temperature: Optional[float] = None
+    brightness: Optional[float] = None
+    contrast: Optional[float] = None
+    saturation: Optional[float] = None
     saved_at: Optional[str] = None
     fps: Optional[float] = None
 
@@ -61,6 +69,14 @@ class ShootingProfile:
         f = self.focus_requested
         if f is None or isinstance(f, bool) or not isinstance(f, int) or not FOCUS_MIN <= f <= FOCUS_MAX:
             out.append("focus non défini ou hors plage")
+        for name in ("exposure", "auto_exposure", "gain", "auto_wb", "wb_temperature",
+                     "brightness", "contrast", "saturation"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                out.append(f"{name} invalide")
         if self.fps is not None and (isinstance(self.fps, bool) or not isinstance(self.fps, (int, float))
                                      or not math.isfinite(self.fps) or not 0 < self.fps <= 120):
             out.append("cadence hors plage")
@@ -74,7 +90,9 @@ class ShootingProfile:
         """Compare what the user chose; readbacks and timestamps are not user changes."""
         if other is None:
             return False
-        keys = ("camera_key", "camera_index", "path", "api", "focus_requested", "fps")
+        keys = ("camera_key", "camera_index", "path", "api", "focus_requested", "fps",
+                "exposure", "auto_exposure", "gain", "auto_wb", "wb_temperature",
+                "brightness", "contrast", "saturation")
         return all(getattr(self, k) == getattr(other, k) for k in keys)
 
     def to_dict(self) -> dict:

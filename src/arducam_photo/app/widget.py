@@ -10,7 +10,7 @@ from typing import Optional
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
                                QStackedWidget, QTabBar, QToolButton, QVBoxLayout, QWidget)
 
@@ -193,6 +193,41 @@ class CameraWidget(QWidget):
         focus_row.addWidget(self.btn_save); focus_row.addWidget(self.unsaved)
         focus_row.addWidget(self.btn_p_capture)
         pl.addLayout(focus_row); pl.addWidget(self.preview_msg)
+        self.camera_settings_toggle = QToolButton()
+        self.camera_settings_toggle.setText("Autres réglages caméra")
+        self.camera_settings_toggle.setCheckable(True)
+        self.camera_settings_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.camera_settings_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.camera_settings_panel = QWidget()
+        settings_form = QFormLayout(self.camera_settings_panel)
+        self.camera_settings_inputs = {}
+        setting_labels = {
+            "auto_exposure": "Mode auto exposition (valeur backend)",
+            "exposure": "Exposition (valeur backend)",
+            "gain": "Gain (valeur backend)",
+            "auto_wb": "Balance des blancs auto (valeur backend)",
+            "wb_temperature": "Température balance des blancs (valeur backend)",
+            "brightness": "Luminosité (valeur backend)",
+            "contrast": "Contraste (valeur backend)",
+            "saturation": "Saturation (valeur backend)",
+        }
+        for name, label in setting_labels.items():
+            editor = QLineEdit()
+            editor.setPlaceholderText("inchangé")
+            editor.setAccessibleName(label)
+            editor.editingFinished.connect(lambda n=name, w=editor: self._camera_control_input(n, w))
+            self.camera_settings_inputs[name] = editor
+            settings_form.addRow(label, editor)
+        self.camera_settings_note = QLabel(
+            "Valeurs transmises telles quelles au backend OpenCV; unités, plages et modes de bascule "
+            "dépendent du pilote. Une valeur vide signifie « ne pas modifier »."
+        )
+        self.camera_settings_note.setWordWrap(True)
+        settings_form.addRow(self.camera_settings_note)
+        self.camera_settings_panel.hide()
+        self.camera_settings_toggle.toggled.connect(self._toggle_camera_settings)
+        pl.addWidget(self.camera_settings_toggle)
+        pl.addWidget(self.camera_settings_panel)
         self.preview_details = QLabel(); self.preview_details.setWordWrap(True)
         self._diagnostic(pl, "preview", (self.fps_label, self.focus_state, self.preview_details))
         fps_row = QHBoxLayout(); fps_row.addWidget(QLabel("Cadence photo demandée")); fps_row.addWidget(self.fps_spin)
@@ -526,6 +561,28 @@ class CameraWidget(QWidget):
             self._guard(self.model.set_focus, value)
         self._refresh_preview_state()
 
+    def _toggle_camera_settings(self, expanded):
+        self.camera_settings_panel.setVisible(expanded)
+        self.camera_settings_toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+    def _camera_control_input(self, name, editor):
+        text = editor.text().strip()
+        try:
+            value = None if not text else float(text)
+        except ValueError:
+            self._error("Valeur caméra invalide.", ValueError("saisir un nombre fini ou laisser vide"))
+            return
+        self._guard(self.model.set_camera_control, name, value)
+
+    def _sync_camera_settings(self, profile):
+        for name, editor in self.camera_settings_inputs.items():
+            value = getattr(profile, name, None)
+            text = "" if value is None else str(value)
+            if editor.text() != text:
+                editor.blockSignals(True)
+                editor.setText(text)
+                editor.blockSignals(False)
+
     def _sync_focus_controls(self, requested: Optional[int]) -> None:
         known = requested is not None
         self.focus_slider.blockSignals(True)
@@ -605,6 +662,16 @@ class CameraWidget(QWidget):
             if "accepted" in kw:
                 self._technical["Consigne acceptée par le pilote"] = "oui" if kw["accepted"] else "non"
             self._refresh_preview_state(kw)
+        elif event == "camera_settings_applied":
+            for name, report in kw["reports"].items():
+                self._technical[f"Caméra {name}"] = (
+                    f"demandé {report.requested}; essayé {report.attempted}; "
+                    f"accepté {report.accepted}; relu {report.readback}; "
+                    f"erreur {report.error or report.readback_error or 'aucune'}"
+                )
+            self._refresh_preview_state()
+        elif event == "camera_settings_failed":
+            self._error("Impossible d’appliquer les réglages caméra.", kw["error"])
         elif event == "cameras":
             self._fill_cameras(kw["indices"] or [self.model.camera.index])
             self._set_capture_busy(False)
@@ -674,6 +741,7 @@ class CameraWidget(QWidget):
         d = self.model.draft
         if d is None:
             return
+        self._sync_camera_settings(d)
         self._sync_focus_controls(d.focus_requested)
         self.fps_spin.blockSignals(True)
         self.fps_spin.setValue(round(d.fps or MODES[d.path].fps))

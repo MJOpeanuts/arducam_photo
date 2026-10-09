@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from .. import engine
+from ..camera_settings import apply_camera_settings
 from ..config import PATHS, SettingReport
 from ..engine import _import_cv2, _open_video_capture
 from ..errors import CameraOpenError, CameraSetupError, CaptureBusyError
@@ -91,6 +92,13 @@ class PreviewSession:
         if self._cap is None:
             raise CameraSetupError("preview non ouvert")
         return self._set("focus", _import_cv2().CAP_PROP_FOCUS, value)
+
+    def apply_settings(self, values) -> dict:
+        if self._cap is None:
+            raise CameraSetupError("preview non ouvert")
+        reports = apply_camera_settings(self._cap, values, _import_cv2())
+        self.settings.update(reports)
+        return reports
 
     def read(self) -> Optional[np.ndarray]:
         """One BGR uint8 HxWx3 frame, or None on a failed/invalid read (counted)."""

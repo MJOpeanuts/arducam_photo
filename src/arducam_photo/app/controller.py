@@ -157,6 +157,11 @@ class CameraController:
             raise ModeError("réglage du focus uniquement pendant le preview")
         self._submit(("focus", int(value)))
 
+    def apply_camera_settings(self, values: dict) -> None:
+        if self._state not in (OPENING, PREVIEW):
+            raise ModeError("réglages caméra uniquement pendant le preview")
+        self._submit(("settings", dict(values)))
+
     def capture(self, job: CaptureJob) -> None:
         """Reserve the camera synchronously (double trigger refused) and run on the worker."""
         with self._lock:
@@ -264,6 +269,8 @@ class CameraController:
             self._do_close()
         elif kind == "focus":
             self._do_focus(cmd[1])
+        elif kind == "settings":
+            self._do_settings(cmd[1])
         elif kind == "capture":
             self._do_capture(cmd[1])
         elif kind in ("load", "process", "save_processed"):
@@ -324,6 +331,20 @@ class CameraController:
             return
         self._emit("focus_applied", requested=value, accepted=rep.accepted, readback=rep.readback)
 
+    def _do_settings(self, values) -> None:
+        if self._session is None:
+            return
+        try:
+            reports = self._session.apply_settings(values)
+        except Exception as e:
+            self._emit("camera_settings_failed", error=e)
+            return
+        self._emit("camera_settings_applied", reports=reports)
+        report = reports.get("focus")
+        if report is not None:
+            self._emit("focus_applied", requested=report.requested,
+                       accepted=report.accepted, readback=report.readback)
+
     def _pump_frame(self) -> None:
         frame = self._session.read()
         if frame is None:
@@ -369,8 +390,9 @@ class CameraController:
         from ..archive import (archive_acquisition, save_output, record_error, OutputOptions,
                                snapshot_ccm)
         from ..processing import ProcessingRecipe, process_image
+        from ..storage import begin_capture_bundle, finish_capture_bundle, fail_capture_bundle
 
-        manifest, stage = None, "acquisition"
+        manifest, capture_manifest, stage = None, None, "acquisition"
         timings = {}
         started = t = self._clock()
         self._processed = None
@@ -378,6 +400,7 @@ class CameraController:
             self._emit("capture_step", step="Acquisition de l’original")
             acquisition = engine.acquire(job.config, cancel_event=self._cancel, _opener=self._opener)
             timings["acquisition_s"] = self._clock() - started
+            capture_manifest = begin_capture_bundle(acquisition, job.photo_dir)
             stage = "archive"
             release_error = getattr(acquisition.info, "release_error", None)
             if release_error:
@@ -410,12 +433,13 @@ class CameraController:
             stage = "output"
             self._emit("capture_step", step="Enregistrement du PNG")
             t = self._clock()
-            path = save_output(image, manifest, recipe, OutputOptions(), ccm_provenance=ccm,
-                               timings=timings)
+            archive_output = save_output(image, manifest, recipe, OutputOptions(), ccm_provenance=ccm,
+                                         timings=timings)
+            path = finish_capture_bundle(capture_manifest, image, recipe, ccm)
             timings["output_s"] = self._clock() - t
             timings["total_until_output_s"] = self._clock() - started
 
-            _persist_timings(manifest, timings, output_path=path)
+            _persist_timings(manifest, timings, output_path=archive_output)
             info = dataclasses.replace(info, duration_s=self._clock() - started,
                                        timings={**info.timings, **timings})
             h, w = image.shape[:2]
@@ -433,8 +457,13 @@ class CameraController:
                     record_error(manifest, stage, e)
                 except Exception:
                     log.exception("could not record archive error")
+            if capture_manifest:
+                try:
+                    fail_capture_bundle(capture_manifest, stage, e)
+                except Exception:
+                    log.exception("could not record capture bundle error")
             self._emit("capture_failed", error=_detach_error(e), recoverable=True, archive_path=manifest,
-                       stage=stage, timings=timings)
+                       capture_manifest_path=capture_manifest, stage=stage, timings=timings)
         finally:
             self._set_state(IDLE)
             self._emit("capture_idle")
