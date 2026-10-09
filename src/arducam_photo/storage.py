@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 import uuid
@@ -11,6 +13,184 @@ import numpy as np
 
 from .config import CaptureConfig, CaptureResult
 from .errors import CameraSetupError, SaveError
+
+
+def begin_capture_bundle(acquisition, directory) -> str:
+    """Publish verified RAW (when available) and a strict per-capture JSON manifest."""
+    from .archive import _jsonable, _versions
+    from .config import NATIVE_108MP
+
+    directory = os.path.abspath(os.fspath(directory))
+    os.makedirs(directory, exist_ok=True)
+    info = acquisition.info
+    try:
+        capture_id = str(uuid.UUID(info.capture_id)) if info.capture_id else str(uuid.uuid4())
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise SaveError(f"invalid capture id: {exc}") from exc
+    marker = os.path.join(directory, f".{capture_id}.incomplete")
+    manifest_path = os.path.join(directory, f"{capture_id}.json")
+    raw_path = os.path.join(directory, f"{capture_id}.raw")
+    png_path = os.path.join(directory, f"{capture_id}.png")
+    if any(os.path.lexists(path) for path in (manifest_path, raw_path, png_path)):
+        raise SaveError("capture id collides with existing artifacts; no files overwritten")
+    try:
+        with open(marker, "xb") as f:
+            f.write(b"capture publication incomplete\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as exc:
+        raise SaveError(f"capture id already used or cannot create completion marker: {exc}") from exc
+    original = acquisition.original
+    if not isinstance(original, np.ndarray) or original.dtype != np.uint8 or not original.size:
+        raise SaveError("capture original must be a nonempty uint8 array")
+    native = info.path == NATIVE_108MP
+    raw_record = None
+    if native:
+        expected_shape = tuple(info.reconstructed_shape or original.shape)
+        expected_bytes = int(np.prod(expected_shape))
+        if (original.dtype != np.uint8 or not original.flags.c_contiguous
+                or tuple(original.shape) != expected_shape or original.nbytes != expected_bytes):
+            raise SaveError("native RAW shape, dtype or storage order does not match acquisition metadata")
+        raw_tmp = os.path.join(directory, f".{capture_id}.{uuid.uuid4().hex}.raw.tmp")
+        digest = hashlib.sha256()
+        try:
+            with open(raw_tmp, "xb") as f:
+                view = memoryview(original).cast("B")
+                for offset in range(0, len(view), 1024 * 1024):
+                    chunk = view[offset:offset + 1024 * 1024]
+                    f.write(chunk)
+                    digest.update(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.getsize(raw_tmp) != original.nbytes or _sha256_file(raw_tmp) != digest.hexdigest():
+                raise SaveError("RAW size or SHA-256 verification failed")
+            os.link(raw_tmp, raw_path)
+            os.unlink(raw_tmp)
+        except Exception as exc:
+            raise SaveError(f"cannot preserve native RAW: {exc}") from exc
+        raw_record = {
+            "status": "preserved", "file": os.path.basename(raw_path),
+            "dimensions": list(original.shape), "dtype": "uint8", "size_bytes": original.nbytes,
+            "organization": "headerless C-order Bayer bytes, row-major",
+            "bayer_pattern": "RGGB software convention; physical sensor pattern unvalidated",
+            "bayer_pattern_status": "derived from existing pipeline convention; hardware not validated",
+            "sha256": digest.hexdigest(),
+        }
+    else:
+        raw_record = {"status": "unavailable", "file": None, "bayer_pattern": None,
+                      "bayer_pattern_status": "not applicable",
+                      "reason": f"{info.path} is a color capture; no native Bayer RAW is available"}
+
+    config = _jsonable(info.config)
+    versions = _versions()
+    data = {
+        "schema_version": 1, "capture_id": capture_id, "captured_at": info.captured_at,
+        "program": {"version": versions.get("program"), "commit": versions.get("commit")},
+        "acquisition": {
+            "path": info.path, "camera": {
+                "identity": None, "identity_status": "device identity unavailable through OpenCV",
+                "index": info.camera_index, "backend": info.api,
+            },
+            "transport_dimensions": list(info.transport_size),
+            "image_dimensions": list(original.shape[:2][::-1]),
+            "dtype": info.dtype, "requested_parameters": config,
+            "parameter_reports": _jsonable(info.settings),
+            "readback_at": info.settings_readback_at,
+            "readback_note": info.settings_readback_note,
+            "stabilization": {
+                "frames_read": info.frames_read, "failed_reads": info.failed_reads,
+                "invalid_buffers": info.invalid_buffers,
+            },
+            "raw": raw_record,
+        },
+        "processing": {"status": "pending", "black_level": None, "demosaic": None,
+                       "color_correction": None, "temperature": None,
+                       "matrix": None, "tuning_file": None},
+        "png": {"status": "pending", "file": os.path.basename(png_path)},
+    }
+    _write_capture_json(manifest_path, data, new=True)
+    return manifest_path
+
+
+def finish_capture_bundle(manifest_path, image, processing, ccm=None) -> str:
+    from .archive import _jsonable
+
+    directory = os.path.dirname(os.path.abspath(manifest_path))
+    capture_id = os.path.splitext(os.path.basename(manifest_path))[0]
+    png_path = os.path.join(directory, f"{capture_id}.png")
+    with open(manifest_path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("capture_id") != capture_id:
+        raise SaveError("capture manifest identity mismatch")
+    save_image(image, png_path, options=OutputOptions())
+    data["processing"] = {
+        "status": "complete", "parameters": _jsonable(processing),
+        "black_level": processing.black_level if data["acquisition"]["path"] == "native_108mp" else None,
+        "demosaic": "COLOR_BayerGR2RGB" if data["acquisition"]["path"] == "native_108mp" else None,
+        "color_correction": bool(ccm and ccm.get("requested")),
+        "temperature": ccm.get("temperature") if ccm else None,
+        "matrix": ccm.get("effective_bgr_matrix") if ccm else None,
+        "tuning_file": ({k: ccm.get(k) for k in ("path", "sha256")} if ccm else None),
+    }
+    data["png"] = {"status": "preserved", "file": os.path.basename(png_path),
+                   "size_bytes": os.path.getsize(png_path), "sha256": _sha256_file(png_path)}
+    _write_capture_json(manifest_path, data)
+    marker = os.path.join(directory, f".{capture_id}.incomplete")
+    os.unlink(marker)
+    return png_path
+
+
+def fail_capture_bundle(manifest_path, stage, error):
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return
+    with open(manifest_path, encoding="utf-8") as f:
+        data = json.load(f)
+    was_rendering = stage in ("render", "output")
+    data["processing"] = {
+        "status": "failed" if was_rendering else "not_run",
+        "raw_preserved": data.get("acquisition", {}).get("raw", {}).get("status") == "preserved",
+    }
+    data["failure"] = {"stage": stage, "error": str(error)}
+    data["png"] = {"status": "failed", "file": os.path.basename(manifest_path)[:-5] + ".png"}
+    _write_capture_json(manifest_path, data)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_capture_json(path, data, *, new=False):
+    from .archive import _jsonable
+
+    payload = json.dumps(_jsonable(data), ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+    tmp = os.path.join(os.path.dirname(path), f".{uuid.uuid4().hex}.json.tmp")
+    with open(tmp, "xb") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    published = False
+    try:
+        if new:
+            os.link(tmp, path)
+        else:
+            os.replace(tmp, path)
+        published = True
+        with open(path, encoding="utf-8") as f:
+            verified = json.load(f)
+        if verified.get("capture_id") != data.get("capture_id"):
+            raise SaveError("capture JSON identity verification failed")
+        raw = verified.get("acquisition", {}).get("raw", {})
+        if raw.get("status") == "preserved":
+            raw_path = os.path.join(os.path.dirname(path), raw["file"])
+            if os.path.getsize(raw_path) != raw["size_bytes"] or _sha256_file(raw_path) != raw["sha256"]:
+                raise SaveError("capture JSON does not match RAW size/SHA-256")
+    finally:
+        if published and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 @dataclass(frozen=True)
@@ -157,7 +337,17 @@ def capture_and_save(config: CaptureConfig, path, overwrite: bool = False) -> Ca
 
     total_started = time.monotonic()
     acquisition = engine.acquire(config)
-    manifest = archive_acquisition(acquisition, os.path.dirname(os.path.abspath(os.fspath(path))))
+    directory = os.path.dirname(os.path.abspath(os.fspath(path)))
+    capture_manifest = (begin_capture_bundle(acquisition, directory)
+                        if hasattr(acquisition, "info") and hasattr(acquisition, "original") else None)
+    try:
+        manifest = archive_acquisition(acquisition, directory)
+    except Exception as e:
+        if capture_manifest:
+            fail_capture_bundle(capture_manifest, "archive", e)
+        raise
+    if capture_manifest is None:
+        capture_manifest = begin_capture_bundle(acquisition, directory)
     release_error = getattr(acquisition.info, "release_error", None)
     if release_error:
         error = CameraSetupError(f"camera release failed: {release_error}")
@@ -167,6 +357,7 @@ def capture_and_save(config: CaptureConfig, path, overwrite: bool = False) -> Ca
             record_error(manifest, "release", error)
         except SaveError:
             pass
+        fail_capture_bundle(capture_manifest, "release", error)
         raise error
     cfg = acquisition.info.config
     native = cfg.path == NATIVE_108MP
@@ -193,6 +384,7 @@ def capture_and_save(config: CaptureConfig, path, overwrite: bool = False) -> Ca
             record_error(manifest, "processing", e)
         except SaveError:
             pass
+        fail_capture_bundle(capture_manifest, "processing", e)
         raise
     try:
         requested_path = os.path.abspath(os.fspath(path))
@@ -212,6 +404,7 @@ def capture_and_save(config: CaptureConfig, path, overwrite: bool = False) -> Ca
                                               "total_s": elapsed})
             data["timings"].update({"processing_s": info.timings["processing_s"], "total_s": elapsed})
         _update_manifest(manifest, link_export)
+        finish_capture_bundle(capture_manifest, result.image, recipe, ccm)
     except Exception as e:
         e.manifest_path = manifest
         e.archive_path = manifest
@@ -219,5 +412,6 @@ def capture_and_save(config: CaptureConfig, path, overwrite: bool = False) -> Ca
             record_error(manifest, "output", e)
         except SaveError:
             pass
+        fail_capture_bundle(capture_manifest, "output", e)
         raise
     return result

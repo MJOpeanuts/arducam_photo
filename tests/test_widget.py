@@ -99,6 +99,24 @@ def test_three_tabs_and_explicit_four_mode_selector(widget, qapp):
     assert widget.tabs.isEnabled()
 
 
+def test_preview_advanced_camera_controls_disable_manual_fields_in_auto_mode(widget, qapp):
+    profile = dataclasses.replace(
+        widget.model.saved, auto_exposure=0.25, auto_exposure_mode="automatic",
+        auto_wb=1, auto_wb_mode="automatic",
+    )
+    widget.model.draft = profile
+    show_mode(widget, PREVIEW_MODE, qapp)
+    assert not widget.camera_settings_inputs["exposure"].isEnabled()
+    assert not widget.camera_settings_inputs["gain"].isEnabled()
+    assert not widget.camera_settings_inputs["wb_temperature"].isEnabled()
+    assert widget.camera_settings_inputs["brightness"].isEnabled()
+    assert widget.camera_settings_toggle.isCheckable()
+    assert not widget.camera_settings_panel.isVisible()
+    widget.camera_settings_toggle.setChecked(True)
+    qapp.processEvents()
+    assert widget.camera_settings_panel.isVisible()
+
+
 def test_processing_comparison_thumbnails_normalized_and_synchronized(widget, qapp):
     from arducam_photo.app.model import PROCESSING_MODE
     show_mode(widget, PROCESSING_MODE, qapp)

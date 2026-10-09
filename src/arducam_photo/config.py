@@ -47,7 +47,8 @@ class CaptureConfig:
     camera_index: OpenCV index. Not a stable hardware identity.
     api: "msmf" (reference), "dshow" or "any". No automatic fallback.
     path: one of MODES; native_108mp requires USB 3. Chosen explicitly.
-    focus: CAP_PROP_FOCUS value (reference demo range 0..1023), or None to leave untouched.
+    Camera-control values are passed through to the selected OpenCV backend without
+    guessed ranges or unit conversions. None means leave the property untouched.
     ccm_path: manufacturer tuning JSON (arducam_108mp.json). Required for
         native_108mp rendering when apply_ccm is True; never read by acquisition.
     apply_ccm: native_108mp only. False skips color correction (recorded in result).
@@ -59,6 +60,16 @@ class CaptureConfig:
     api: str = "msmf"
     path: str = NATIVE_108MP
     focus: Optional[int] = None
+    exposure: Optional[float] = None
+    auto_exposure: Optional[float] = None
+    auto_exposure_mode: Optional[str] = None
+    gain: Optional[float] = None
+    auto_wb: Optional[float] = None
+    auto_wb_mode: Optional[str] = None
+    wb_temperature: Optional[float] = None
+    brightness: Optional[float] = None
+    contrast: Optional[float] = None
+    saturation: Optional[float] = None
     ccm_path: Optional[str] = None
     apply_ccm: bool = True
     stabilization_reads: int = 5
@@ -75,6 +86,20 @@ class CaptureConfig:
             raise CaptureConfigError("camera_index must be an integer >= 0")
         if self.focus is not None and (type(self.focus) is not int or self.focus < 0):
             raise CaptureConfigError("focus must be None or an integer >= 0")
+        for name in ("exposure", "auto_exposure", "gain", "auto_wb", "wb_temperature",
+                     "brightness", "contrast", "saturation"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise CaptureConfigError(f"{name} must be None or a finite number")
+        for name, command in (("auto_exposure_mode", "auto_exposure"), ("auto_wb_mode", "auto_wb")):
+            mode = getattr(self, name)
+            if mode not in (None, "automatic", "manual"):
+                raise CaptureConfigError(f"{name} must be None, 'automatic' or 'manual'")
+            if mode is not None and getattr(self, command) is None:
+                raise CaptureConfigError(f"{name} requires a {command} backend value")
         for name in ("stabilization_reads", "max_failed_reads", "max_invalid_buffers"):
             v = getattr(self, name)
             if type(v) is not int or v < 0:
@@ -95,6 +120,10 @@ class SettingReport:
     requested: Any
     accepted: Optional[bool]  # return value of cap.set(); None if not attempted
     readback: Any = None
+    attempted: bool = True
+    error: Optional[str] = None
+    readback_error: Optional[str] = None
+    mode: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +149,8 @@ class AcquisitionInfo:
     timings: dict = field(default_factory=dict)
     capture_id: str = ""
     captured_at: str = ""
+    settings_readback_at: Optional[str] = None
+    settings_readback_note: str = "Driver reads are not a synchronized sensor measurement."
     camera_released: bool = False
     release_error: Optional[str] = None
 

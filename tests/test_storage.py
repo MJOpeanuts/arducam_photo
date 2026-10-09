@@ -1,7 +1,11 @@
 import numpy as np
 import pytest
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from uuid import uuid4
 
 import arducam_photo as ap
+from arducam_photo.config import AcquisitionInfo, AcquisitionResult, SettingReport
 from conftest import FakeCap, opener_for
 
 
@@ -56,6 +60,12 @@ def test_capture_and_save_writes_720p_png(tmp_path, monkeypatch):
     assert metadata["outputs"][0]["recipe"]["version"] == 1
     assert metadata["outputs"][0]["timings"]["total_s"] > 0
     assert "ccm" in metadata["outputs"][0]
+    bundle, = tmp_path.glob("*.json")
+    capture_id = json.loads(bundle.read_text())["capture_id"]
+    assert bundle.name == f"{capture_id}.json"
+    assert (tmp_path / f"{capture_id}.png").exists()
+    assert not (tmp_path / f"{capture_id}.raw").exists()
+    assert not (tmp_path / f".{capture_id}.incomplete").exists()
 
 
 def test_grayscale_png_roundtrip(tmp_path):
@@ -156,3 +166,92 @@ def test_archive_failure_has_no_recoverable_archive_attribute(tmp_path, monkeypa
         ap.capture_and_save(ap.CaptureConfig(path="color_720p"), tmp_path / "out.png")
     assert not hasattr(raised.value, "archive_path")
     assert not hasattr(raised.value, "manifest_path")
+
+
+def _bundle_acquisition(path="native_108mp"):
+    capture_id = str(uuid4())
+    raw = np.arange(24, dtype=np.uint8).reshape(4, 6)
+    frame = raw if path == "native_108mp" else np.zeros((4, 6, 3), np.uint8)
+    cfg = ap.CaptureConfig(path=path, apply_ccm=False, stabilization_reads=0)
+    info = AcquisitionInfo(
+        config=cfg, api="msmf", camera_index=2, path=path, transport_size=(3, 4),
+        settings={"focus": SettingReport(0, False, float("nan"))},
+        frames_read=6, failed_reads=1, invalid_buffers=2, received_shape=(24,),
+        reconstructed_shape=tuple(frame.shape), capture_id=capture_id,
+        captured_at=datetime.now(timezone.utc).isoformat(),
+        settings_readback_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return AcquisitionResult(frame, info)
+
+
+def test_capture_bundle_raw_json_png_share_id_and_verify_integrity(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    from arducam_photo import storage
+
+    acquisition = _bundle_acquisition()
+    manifest = storage.begin_capture_bundle(acquisition, tmp_path)
+    capture_id = acquisition.info.capture_id
+    raw_path = tmp_path / f"{capture_id}.raw"
+    json_path = tmp_path / f"{capture_id}.json"
+    marker = tmp_path / f".{capture_id}.incomplete"
+    assert raw_path.read_bytes() == acquisition.original.tobytes()
+    data = json.loads(json_path.read_text())
+    assert data["capture_id"] == capture_id
+    assert data["acquisition"]["raw"]["size_bytes"] == acquisition.original.nbytes
+    assert data["acquisition"]["raw"]["sha256"] == hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    assert data["acquisition"]["parameter_reports"]["focus"]["readback"] is None
+    assert b"NaN" not in json_path.read_bytes()
+    assert marker.exists()
+
+    def save_fake(image, path, **kwargs):
+        open(path, "xb").write(b"png data")
+        return str(path)
+
+    monkeypatch.setattr(storage, "save_image", save_fake)
+    from arducam_photo.processing import ProcessingRecipe
+    recipe = ProcessingRecipe(apply_ccm=False)
+    png = storage.finish_capture_bundle(manifest, np.zeros((4, 6, 3), np.uint8), recipe)
+    assert png == str(tmp_path / f"{capture_id}.png")
+    assert (tmp_path / f"{capture_id}.png").read_bytes() == b"png data"
+    assert not marker.exists()
+    assert json.loads(json_path.read_text())["png"]["status"] == "preserved"
+
+
+def test_capture_bundle_failure_keeps_raw_and_detectable_marker(tmp_path):
+    import json
+    from arducam_photo.storage import begin_capture_bundle, fail_capture_bundle
+
+    acquisition = _bundle_acquisition()
+    manifest = begin_capture_bundle(acquisition, tmp_path)
+    fail_capture_bundle(manifest, "render", RuntimeError("render failed"))
+    capture_id = acquisition.info.capture_id
+    assert (tmp_path / f"{capture_id}.raw").read_bytes() == acquisition.original.tobytes()
+    data = json.loads((tmp_path / f"{capture_id}.json").read_text())
+    assert data["processing"]["status"] == "failed"
+    assert data["processing"]["raw_preserved"] is True
+    assert (tmp_path / f".{capture_id}.incomplete").exists()
+
+
+def test_720p_capture_bundle_has_no_raw(tmp_path):
+    import json
+    from arducam_photo.storage import begin_capture_bundle
+
+    acquisition = _bundle_acquisition("color_720p")
+    manifest = begin_capture_bundle(acquisition, tmp_path)
+    capture_id = acquisition.info.capture_id
+    assert not (tmp_path / f"{capture_id}.raw").exists()
+    data = json.loads(open(manifest, encoding="utf8").read())
+    assert data["acquisition"]["raw"]["status"] == "unavailable"
+    assert data["acquisition"]["raw"]["file"] is None
+
+
+def test_capture_bundle_never_overwrites_existing_artifacts(tmp_path):
+    from arducam_photo.storage import begin_capture_bundle
+
+    acquisition = _bundle_acquisition("color_720p")
+    (tmp_path / f"{acquisition.info.capture_id}.json").write_text("keep")
+    with pytest.raises(ap.SaveError):
+        begin_capture_bundle(acquisition, tmp_path)
+    assert (tmp_path / f"{acquisition.info.capture_id}.json").read_text() == "keep"
+    assert not (tmp_path / f".{acquisition.info.capture_id}.incomplete").exists()

@@ -19,6 +19,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from .ccm import load_ccm_file
+from .camera_settings import apply_camera_settings, read_camera_settings
 from .config import AcquisitionInfo, AcquisitionResult, CaptureConfig, CaptureResult, SettingReport, NATIVE_108MP, MODES
 from .errors import (
     CameraOpenError, CameraReadError, CameraSetupError, CaptureBusyError,
@@ -196,8 +197,7 @@ def _run(cfg, cancel, opener) -> AcquisitionResult:
             setp("width", cv2.CAP_PROP_FRAME_WIDTH, mode.width, True)
             setp("height", cv2.CAP_PROP_FRAME_HEIGHT, mode.height, True)
         setp("fps", cv2.CAP_PROP_FPS, mode.fps if cfg.fps is None else cfg.fps)
-        if cfg.focus is not None:
-            setp("focus", cv2.CAP_PROP_FOCUS, cfg.focus)
+        settings.update(apply_camera_settings(cap, cfg, cv2))
 
         setup_s = time.monotonic() - t0
         read_started = time.monotonic()
@@ -205,6 +205,8 @@ def _run(cfg, cancel, opener) -> AcquisitionResult:
         frame, frames_read, failed, invalid = _stabilize(cap, cfg, validate, cancel)
 
         _check_cancel(cancel)
+        readback_at = datetime.now(timezone.utc).isoformat()
+        settings = read_camera_settings(cap, settings, cv2)
         read_s = time.monotonic() - read_started
         copy_started = time.monotonic()
         received_shape = tuple(frame.shape)
@@ -218,6 +220,7 @@ def _run(cfg, cancel, opener) -> AcquisitionResult:
             duration_s=time.monotonic() - t0,
             received_shape=received_shape, reconstructed_shape=tuple(original.shape),
             dtype=str(original.dtype), capture_id=capture_id, captured_at=captured_at,
+            settings_readback_at=readback_at,
             timings={"setup_s": setup_s, "read_s": read_s, "copy_s": time.monotonic() - copy_started},
         )
         log.info("done %dx%d reads=%d failed=%d invalid=%d ccm=%s %.2fs",
