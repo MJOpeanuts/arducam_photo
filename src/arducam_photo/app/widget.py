@@ -13,7 +13,7 @@ from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-                               QStackedWidget, QTabBar, QToolButton, QVBoxLayout, QWidget)
+                               QStackedWidget, QStyle, QTabBar, QToolButton, QVBoxLayout, QWidget)
 
 from ..config import PATHS, MODES
 from .controller import ModeError
@@ -338,7 +338,24 @@ class CameraWidget(QWidget):
         self.tabs.currentChanged.connect(self._navigate)
         self.tabs.tabBarClicked.connect(
             lambda index: self._navigate(index) if self.model.mode == START and not self.model.pending else None)
-        lay.addWidget(self.tabs); lay.addWidget(self.stack, 1)
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(self.tabs)
+        top_bar.addStretch()
+        self.fullscreen_button = QPushButton("Plein écran")
+        self.fullscreen_button.setIconSize(QSize(18, 18))
+        self.fullscreen_button.clicked.connect(self.fullscreen_requested.emit)
+        self._fullscreen_controls.append(self.fullscreen_button)
+        self.set_fullscreen_state(False)
+        self.quit_button = QPushButton("Quitter l’application")
+        self.quit_button.setToolTip(
+            "Quitter proprement après décision sur les réglages non sauvegardés, "
+            "arrêt sûr de la caméra et fermeture du stockage")
+        self.quit_button.setAccessibleName("Quitter l’application")
+        self.quit_button.clicked.connect(self.quit_requested.emit)
+        top_bar.addWidget(self.fullscreen_button)
+        top_bar.addWidget(self.quit_button)
+        lay.addLayout(top_bar)
+        lay.addWidget(self.stack, 1)
         self.footer = ImageView()
         self.footer.setObjectName("footer")
         self.footer.setAccessibleName("powered by")
@@ -380,19 +397,11 @@ class CameraWidget(QWidget):
         for widget in widgets:
             widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             inner.addWidget(widget)
-        fullscreen = QPushButton("Plein écran")
-        fullscreen.setToolTip("Toute la fenêtre · F11 pour basculer · Échap pour revenir")
-        fullscreen.clicked.connect(self.fullscreen_requested.emit)
         startup = QCheckBox("Démarrer en plein écran")
         startup.setChecked(self.model.settings.start_fullscreen)
         startup.toggled.connect(self._set_start_fullscreen)
-        quit_button = QPushButton("Quitter l’application")
-        quit_button.clicked.connect(self.quit_requested.emit)
-        self._fullscreen_controls.append(fullscreen)
         self._startup_controls.append(startup)
-        inner.addWidget(fullscreen)
         inner.addWidget(startup)
-        inner.addWidget(quit_button)
         inner.addStretch(); area.setWidget(content); area.hide()
         toggle.toggled.connect(area.setVisible)
         toggle.toggled.connect(lambda checked: toggle.setArrowType(
@@ -403,7 +412,17 @@ class CameraWidget(QWidget):
 
     def set_fullscreen_state(self, enabled):
         for button in self._fullscreen_controls:
-            button.setText("Quitter le plein écran" if enabled else "Plein écran")
+            if enabled:
+                button.setText("Mode fenêtré")
+                button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarNormalButton))
+                button.setToolTip("Revenir en mode fenêtré · F11 ou Échap")
+                button.setAccessibleName("Revenir en mode fenêtré")
+            else:
+                button.setText("Plein écran")
+                button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton))
+                button.setToolTip(
+                    "Passer en plein écran sur toute l’application · F11 pour basculer · Échap pour revenir")
+                button.setAccessibleName("Passer en plein écran sur toute l’application")
 
     def _set_start_fullscreen(self, enabled):
         self._guard(self.model.set_start_fullscreen, enabled)
