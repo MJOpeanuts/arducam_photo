@@ -145,6 +145,27 @@ def test_cancel_replacement_leaves_bank_and_draft_unchanged(widget, monkeypatch)
     assert model.bank.revision == 1 and model.has_unsaved()
 
 
+def test_confirmed_revision_conflict_preserves_concurrent_bank_and_draft(widget, monkeypatch):
+    model = widget.model
+    target = model.banks.create("Cible concurrente", model.draft)
+    widget._refresh_banks(target.id)
+    model.draft = dataclasses.replace(model.draft, focus_requested=402)
+    draft = model.draft
+    saved = model.saved
+    other_connection = SQLiteBankRepository(model.banks.path)
+    def confirm(*args):
+        assert "révision 1" in args[2]
+        other_connection.save(target.id, dataclasses.replace(target.profile, focus_requested=450),
+                              expected_revision=target.revision)
+        return QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    assert not widget._save_bank_target()
+    current = other_connection.get(target.id)
+    assert current.revision == 2 and current.profile.focus_requested == 450
+    assert model.draft == draft and model.saved == saved and model.has_unsaved()
+    assert widget.preview_msg.text().startswith("Impossible d’enregistrer la bank.")
+
+
 def test_unsaved_save_cannot_leave_after_target_save_cancelled(widget, monkeypatch):
     model = widget.model
     model.draft = dataclasses.replace(model.draft, focus_requested=402)
@@ -175,7 +196,7 @@ def test_capabilities_require_explicit_probe_and_finite_accepted_readback(widget
     assert "relu" in widget.preview_details.text()
 
 
-@pytest.mark.parametrize("state", ["adjusting", "restoring"])
+@pytest.mark.parametrize("state", ["adjusting", "restoring", "probing_controls"])
 def test_busy_adjustment_locks_edits_banks_navigation_and_close(widget, monkeypatch, state):
     enable_controls(widget)
     widget.model.controller.state = state
@@ -187,6 +208,31 @@ def test_busy_adjustment_locks_edits_banks_navigation_and_close(widget, monkeypa
     assert widget.btn_cancel_adjustment.isEnabled() == (state == "adjusting")
     monkeypatch.setattr(widget, "_info", lambda text: None)
     assert not widget.can_close()
+
+
+def test_restore_warning_never_claims_settings_restored(widget):
+    widget._on_event("adjustment_restored", {"warnings": ["gain: restoration impossible"]})
+    assert "Restauration non vérifiée/incomplète" in widget.adjustment_summary.text()
+    assert "Réglages restaurés" not in widget.adjustment_summary.text()
+    assert "restoration impossible" in widget.adjustment_summary.text()
+
+
+def test_worker_restoration_started_disables_cancel_and_shows_wait_status(widget):
+    widget.model.controller.state = "restoring"
+    widget._on_event("adjustment_restoration_started", {})
+    assert "Restauration des réglages en cours" in widget.adjustment_summary.text()
+    assert not widget.btn_cancel_adjustment.isEnabled()
+    assert not widget.tabs.isEnabled()
+
+
+@pytest.mark.parametrize("warnings", [[], ["exposure: restoration failed"]])
+def test_adjustment_failure_replaces_running_summary_with_restoration_status(widget, warnings):
+    widget.adjustment_summary.setText("Auto-ajustement en cours.")
+    widget._on_event("adjustment_failed", {"error": RuntimeError("interrupted"),
+                                         "restoration_warnings": warnings})
+    text = widget.adjustment_summary.text()
+    assert "interrompu" in text and "en cours" not in text
+    assert ("Restauration non vérifiée/incomplète" in text) == bool(warnings)
 
 
 def test_pending_proposal_locks_settings_but_validation_only_updates_draft(widget):

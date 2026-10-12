@@ -206,20 +206,23 @@ class SessionModel:
         self._ui("bank_changed", bank=bank)
         return bank
 
-    def save_bank(self, bank_id: str, *, confirm_replace: bool = False):
+    def save_bank(self, bank_id: str, *, confirm_replace: bool = False,
+                  expected_revision: Optional[int] = None):
         self._editable()
         if self.banks is None:
             raise ProfileMissing("Stockage des banks non configuré.")
         if not confirm_replace:
             raise NeedsDecision("Confirmez le remplacement de la bank choisie.")
-        target = self.bank if self.bank is not None and self.bank.id == bank_id else self.banks.get(bank_id)
-        bank = self.banks.save(bank_id, self.draft, expected_revision=target.revision)
+        if expected_revision is None:
+            target = self.bank if self.bank is not None and self.bank.id == bank_id else self.banks.get(bank_id)
+            expected_revision = target.revision
+        bank = self.banks.save(bank_id, self.draft, expected_revision=expected_revision)
         self.bank, self.saved = bank, bank.profile
         self.draft = dataclasses.replace(self.saved)
         self._ui("bank_changed", bank=bank)
         return bank
 
-    def _resolve_unsaved(self, decision) -> bool:
+    def _resolve_unsaved(self, decision, *, discard=True) -> bool:
         if self.proposal is not None:
             raise ProposalPending("Validez ou rejetez la proposition avant de continuer.")
         if not self.has_unsaved():
@@ -231,7 +234,8 @@ class SessionModel:
         if decision == SAVE:
             self.save_profile(confirm_replace=True)
         elif decision == DISCARD:
-            self.draft = dataclasses.replace(self.saved) if self.saved else None
+            if discard:
+                self.draft = dataclasses.replace(self.saved) if self.saved else None
         else:
             raise ValueError(f"unknown decision {decision!r}")
         return True
@@ -239,24 +243,24 @@ class SessionModel:
     def load_bank(self, bank_id: str, decision=None) -> bool:
         self._editable()
         bank = self.banks.get(bank_id)
-        profile = bank.profile
-        if profile.camera_key != self.camera.key or profile.camera_index != self.camera.index or profile.api != self.api:
-            raise CaptureConfigError("Contexte caméra/backend différent ; choisissez ce contexte avant de charger la bank. "
-                                     "L’index OpenCV ne garantit pas l’identité matérielle.")
-        previous_draft = self.draft
-        if not self._resolve_unsaved(decision):
+        self._compatible_bank_profile(bank)
+        if not self._resolve_unsaved(decision, discard=False):
             return False
-        try:
-            self.controller.apply_camera_settings(self._camera_control_values(profile))
-        except Exception:
-            if decision == DISCARD:
-                self.draft = previous_draft
-            raise
+        bank = self.banks.get(bank_id)
+        profile = self._compatible_bank_profile(bank)
+        self.controller.apply_camera_settings(self._camera_control_values(profile))
         self.bank, self.saved = bank, profile
         self.draft = dataclasses.replace(profile)
         self.path = profile.path
         self._ui("bank_changed", bank=bank)
         return True
+
+    def _compatible_bank_profile(self, bank):
+        profile = bank.profile
+        if profile.camera_key != self.camera.key or profile.camera_index != self.camera.index or profile.api != self.api:
+            raise CaptureConfigError("Contexte caméra/backend différent ; choisissez ce contexte avant de charger la bank. "
+                                     "L’index OpenCV ne garantit pas l’identité matérielle.")
+        return profile
 
     def start_auto_adjustment(self, options) -> None:
         self._editable()

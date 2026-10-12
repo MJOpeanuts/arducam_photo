@@ -198,6 +198,10 @@ fichiers. Un mode sauvegardé automatique reste automatique ; aucune exposition 
 entre prises n’est promise. Un réglage efficace en Preview 720p n’est pas présumé efficace
 dans le transport RAW natif.
 
+Dans les manifestes, `control_provenance` distingue consignes de prise de vue, relectures,
+contrôles non relus et commandes rejetées ; `post_processing.requested` conserve séparément
+`apply_ccm`/`ccm_path`. Le bloc `processing` décrit le rendu réellement exécuté.
+
 #### Recette Windows Arducam — à exécuter sur matériel
 
 1. Fermer toute autre application caméra ; installer/lancer comme ci-dessus, sur USB 3

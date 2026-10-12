@@ -660,7 +660,8 @@ class CameraWidget(QWidget):
                 QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
                 return False
-            saved = self.model.save_bank(bank_id, confirm_replace=True)
+            saved = self.model.save_bank(bank_id, confirm_replace=True,
+                                         expected_revision=bank.revision)
         except Exception as error:
             self._error("Impossible d’enregistrer la bank.", error)
             return False
@@ -982,10 +983,14 @@ class CameraWidget(QWidget):
             if kw.get("error"):
                 self._error("Impossible de vérifier les commandes caméra.", kw["error"])
         elif event in ("adjustment_started", "adjustment_proposed", "adjustment_restored",
-                       "adjustment_failed", "proposal_resolved"):
+                       "adjustment_failed", "adjustment_restoration_started", "proposal_resolved"):
+            warnings = kw.get("warnings", kw.get("restoration_warnings", []))
             if event in ("adjustment_restored", "adjustment_failed", "proposal_resolved"):
                 self._proposal_restoring = False
-            if event == "adjustment_proposed":
+            if event == "adjustment_restoration_started":
+                self.adjustment_summary.setText("Restauration des réglages en cours. "
+                                                "Attendez la fin avant de réessayer une action.")
+            elif event == "adjustment_proposed":
                 result = kw["result"]
                 converged = getattr(result, "converged", False)
                 reason = {
@@ -1002,12 +1007,16 @@ class CameraWidget(QWidget):
                     f"durée : {getattr(result, 'elapsed', '–')} s\n"
                     "Valider modifie seulement les réglages courants, sans sauvegarder.")
             elif event == "adjustment_failed":
+                self.adjustment_summary.setText(
+                    "Auto-ajustement interrompu. " +
+                    ("Restauration non vérifiée/incomplète." if warnings
+                     else "Aucun avertissement de restauration signalé."))
                 self._error("Auto-ajustement interrompu.", kw.get("error", "échec"))
             elif event in ("adjustment_restored", "proposal_resolved"):
                 self.adjustment_summary.setText(
-                    "Réglages restaurés." if event == "adjustment_restored"
+                    ("Restauration non vérifiée/incomplète." if warnings else "Réglages restaurés.")
+                    if event == "adjustment_restored"
                     else "Proposition validée dans le brouillon, non sauvegardée.")
-            warnings = kw.get("warnings", kw.get("restoration_warnings", []))
             if warnings:
                 self.adjustment_summary.setText(self.adjustment_summary.text() +
                                                 "\nRestauration à vérifier : " + str(warnings))
@@ -1161,7 +1170,7 @@ class CameraWidget(QWidget):
     # ---- closing ----
     def can_close(self) -> bool:
         """False if the window must stay open (capture running, or user stays in Preview)."""
-        if self.model.controller.state in ("capturing", "processing", "adjusting", "restoring"):
+        if not self.model.controller.can_change_mode or self.model.pending:
             self._info("Une opération est en cours : attendez la fin avant de fermer.")
             return False
         if self.model.proposal is not None and not self._resolve_proposal_prompt():

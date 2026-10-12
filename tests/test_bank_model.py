@@ -188,6 +188,31 @@ def test_bank_switch_unsaved_decisions_and_explicit_save(session):
     assert session.draft.focus_requested == 400
 
 
+def test_reload_active_bank_after_save_uses_new_revision(session):
+    before = session.bank
+    session.set_focus(400)
+    assert session.load_bank(before.id, SAVE)
+    assert session.bank.revision == before.revision + 1
+    assert session.draft.focus_requested == 400
+    assert not session.has_unsaved()
+    session.set_focus(500)
+    session.save_bank(before.id, confirm_replace=True)
+    assert session.bank.revision == before.revision + 2
+
+
+def test_replacement_uses_confirmed_revision_even_for_another_bank(session):
+    target = session.banks.create("Autre", session.draft)
+    session.set_focus(400)
+    concurrent = session.banks.save(
+        target.id, dataclasses.replace(target.profile, focus_requested=900),
+        expected_revision=target.revision,
+    )
+    with pytest.raises(StoreError, match="revision conflict"):
+        session.save_bank(target.id, confirm_replace=True, expected_revision=target.revision)
+    assert session.banks.get(target.id) == concurrent
+    assert session.draft.focus_requested == 400 and session.has_unsaved()
+
+
 def test_storage_failure_keeps_dirty_copy_and_saved_bank(session, monkeypatch):
     session.set_focus(400)
     before = session.bank

@@ -372,7 +372,7 @@ def test_capture_freezes_bank_snapshot_in_both_manifests(tmp_path, monkeypatch, 
         monkeypatch.setattr(engine, "TRANSPORT_H", 8)
     original = np.full((96,) if raw else (8, 12, 3), 70, np.uint8)
     camera, events = Camera(original), Events()
-    config = CaptureConfig(api="any", path=mode, focus=31, gain=2, apply_ccm=False,
+    config = CaptureConfig(api="any", path=mode, focus=31, gain=2, contrast=0.5, apply_ccm=False,
                            stabilization_reads=1)
     snapshot = {"id": "bank-1", "name": "workbench", "revision": 3, "schema_version": 1,
                 "configuration": {"camera": {"focus": 31, "gain": 2},
@@ -405,12 +405,25 @@ def test_capture_freezes_bank_snapshot_in_both_manifests(tmp_path, monkeypatch, 
             assert metadata["bank_snapshot"] == expected
             provenance = metadata["control_provenance"]
             assert provenance["requested"]["focus"] == 31
+            assert "apply_ccm" not in provenance["requested"]
+            assert "ccm_path" not in provenance["requested"]
             assert provenance["reports"]["focus"]["accepted"] is True
             assert provenance["readbacks"]["focus"] == 31
             assert "brightness" in provenance["unavailable"]
+            assert "contrast" in provenance["rejected"]
+            assert "contrast" not in provenance["unavailable"]
+            assert provenance["readbacks"]["contrast"] == 0
+            assert provenance["reports"]["contrast"]["accepted"] is False
+            assert metadata["post_processing"]["requested"] == {
+                "apply_ccm": False, "ccm_path": None}
             assert any("preview != RAW" in text for text in provenance["limitations"])
             assert any("fragile" in text for text in provenance["limitations"])
             assert any("identical exposure" in text for text in provenance["limitations"])
+        assert "apply_ccm" not in capture_data["acquisition"]["requested_parameters"]
+        assert "ccm_path" not in capture_data["acquisition"]["requested_parameters"]
+        assert capture_data["processing"]["parameters"]["apply_ccm"] is False
+        assert archive_data["outputs"][0]["recipe"]["apply_ccm"] is False
+        assert archive_data["info"]["config"]["apply_ccm"] is False
         loaded = archive.load_acquisition(done["manifest_path"])
         assert np.array_equal(loaded.original, original.reshape((8, 12) if raw else (8, 12, 3)))
         assert camera.released == 1
