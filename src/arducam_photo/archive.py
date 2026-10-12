@@ -60,6 +60,46 @@ def _jsonable(value):
     raise SaveError(f"metadata value is not serializable: {type(value).__name__}")
 
 
+def _split_requested_parameters(config):
+    rendering = {"apply_ccm", "ccm_path"}
+    return (
+        {key: value for key, value in config.items() if key not in rendering},
+        {key: value for key, value in config.items() if key in rendering},
+    )
+
+
+def _control_provenance(info):
+    from .camera_settings import _ORDER
+
+    reports = info.get("settings") or {}
+    readbacks, unavailable, rejected = {}, [], []
+    for name, _ in _ORDER:
+        report = reports.get(name) or {}
+        value = report.get("readback")
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or report.get("readback_error")):
+            value = None
+        readbacks[name] = value
+        if value is None:
+            unavailable.append(name)
+        if report.get("accepted") is False:
+            rejected.append(name)
+    shooting, _ = _split_requested_parameters(info.get("config") or {})
+    return {
+        "requested": shooting,
+        "reports": reports,
+        "readbacks": readbacks,
+        "unavailable": unavailable,
+        "rejected": rejected,
+        "limitations": [
+            "Preview measurements are not native RAW measurements; preview != RAW.",
+            "OpenCV camera index is a fragile association, not a stable device identity.",
+            "Automatic controls do not guarantee identical exposure between captures.",
+            "Driver acceptance/readback is not proof of physical image effect.",
+        ],
+    }
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as f:
@@ -434,6 +474,11 @@ def archive_acquisition(acquisition, directory) -> str:
             "versions": _versions(), "path": mode, "dtype": "uint8",
             "received_shape": info_data.get("received_shape", list(original.shape)),
             "reconstructed_shape": list(original.shape), "info": info_data,
+            "bank_snapshot": info_data.get("bank_snapshot"),
+            "control_provenance": _control_provenance(info_data),
+            "post_processing": {
+                "requested": _split_requested_parameters(info_data.get("config") or {})[1],
+            },
             "camera": {"index": info_data.get("camera_index"), "api": info_data.get("api"),
                        "settings": info_data.get("settings", {})},
             "provenance": {"bayer": "reference GR convention" if raw else None,

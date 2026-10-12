@@ -4,13 +4,14 @@ work runs on the controller's worker thread; this module only displays and forwa
 from __future__ import annotations
 
 import os
+import math
 from datetime import datetime
 from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
                                QStackedWidget, QTabBar, QToolButton, QVBoxLayout, QWidget)
 
@@ -18,7 +19,7 @@ from ..config import PATHS, MODES
 from .controller import ModeError
 from .icons import bundled_pixmap, lucide_icon
 from .model import (CAPTURE_MODE, PROCESSING_MODE, DISCARD, PATH_LABELS, PREVIEW_MODE, SAVE, START, STAY,
-                    NeedsDecision, ProfileMissing, SessionModel)
+                    NeedsDecision, ProfileMissing, ProposalPending, SessionModel)
 from .paths import open_in_system
 from .profile import FOCUS_MAX, FOCUS_MIN
 from .processing_widget import ProcessingWidget
@@ -72,6 +73,7 @@ class CameraWidget(QWidget):
     def __init__(self, model: SessionModel, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.model = model
+        self._proposal_restoring = False
         model._ui = lambda event, **kw: self._event.emit(event, kw)
         self._event.connect(self._on_event)
         self._build()
@@ -79,6 +81,7 @@ class CameraWidget(QWidget):
         self._fps_timer.setInterval(500)
         self._fps_timer.timeout.connect(self._update_fps)
         self._show_page(START)
+        self._refresh_banks()
 
     # ---- layout ----
     def _build(self) -> None:
@@ -92,7 +95,7 @@ class CameraWidget(QWidget):
             QLabel#title { font-size: 23px; font-weight: 600; }
             QLabel#muted { color: #A4A7A9; }
             QLabel#image { background: #111314; border: 1px solid #343739; border-radius: 8px; }
-            QPushButton, QToolButton, QComboBox, QSpinBox {
+            QPushButton, QToolButton, QComboBox, QSpinBox, QDoubleSpinBox {
                 background: #26292B; border: 1px solid #434648; border-radius: 6px;
                 padding: 7px 12px; min-height: 20px; }
             QPushButton:hover, QToolButton:hover { background: #343739; }
@@ -193,6 +196,37 @@ class CameraWidget(QWidget):
         focus_row.addWidget(self.btn_save); focus_row.addWidget(self.unsaved)
         focus_row.addWidget(self.btn_p_capture)
         pl.addLayout(focus_row); pl.addWidget(self.preview_msg)
+        bank_row = QHBoxLayout()
+        self.bank_combo = QComboBox()
+        self.bank_combo.setAccessibleName("Bank cible de chargement ou sauvegarde")
+        self.btn_load_bank = QPushButton("Charger la bank")
+        self.btn_load_bank.clicked.connect(self._load_bank)
+        self.btn_create_bank = QPushButton("Créer une bank…")
+        self.btn_create_bank.clicked.connect(self._create_bank)
+        for control in (QLabel("Bank cible"), self.bank_combo, self.btn_load_bank, self.btn_create_bank):
+            bank_row.addWidget(control)
+            control.setVisible(self.model.banks is not None)
+        pl.addLayout(bank_row)
+        adjustment_row = QHBoxLayout()
+        self.btn_probe_controls = QPushButton("Vérifier commandes")
+        self.btn_probe_controls.clicked.connect(self._probe_controls)
+        self.btn_adjust = QPushButton("Auto-ajustement…")
+        self.btn_adjust.clicked.connect(self._auto_adjust)
+        self.btn_cancel_adjustment = QPushButton("Annuler l’ajustement")
+        self.btn_cancel_adjustment.clicked.connect(lambda: self._guard(self.model.controller.cancel_adjustment))
+        self.btn_accept_proposal = QPushButton("Valider la proposition")
+        self.btn_accept_proposal.clicked.connect(self._accept_proposal)
+        self.btn_reject_proposal = QPushButton("Rejeter la proposition")
+        self.btn_reject_proposal.clicked.connect(self._reject_proposal)
+        for button in (self.btn_probe_controls, self.btn_adjust, self.btn_cancel_adjustment,
+                       self.btn_accept_proposal, self.btn_reject_proposal):
+            adjustment_row.addWidget(button)
+        pl.addLayout(adjustment_row)
+        self.adjustment_summary = QLabel()
+        self.adjustment_summary.setWordWrap(True)
+        self.adjustment_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.adjustment_summary.hide()
+        pl.addWidget(self.adjustment_summary)
         self.camera_settings_toggle = QToolButton()
         self.camera_settings_toggle.setText("Autres réglages caméra")
         self.camera_settings_toggle.setCheckable(True)
@@ -379,6 +413,10 @@ class CameraWidget(QWidget):
             checkbox.blockSignals(False)
 
     def _refresh_diagnostic(self):
+        if not self.model.capabilities:
+            for key in list(self._technical):
+                if key.startswith("Commandes vérifiées caméra"):
+                    self._technical.pop(key)
         prof = self.model.draft if self.model.mode == PREVIEW_MODE else self.model.saved
         req = getattr(prof, "focus_requested", None)
         rb = getattr(prof, "focus_readback", None)
@@ -394,6 +432,9 @@ class CameraWidget(QWidget):
             self.model.ccm_status(),
         ]
         lines.extend(f"{key} : {value}" for key, value in self._technical.items())
+        if self.model.banks is not None:
+            lines.append("Commandes inconnues ou indisponibles désactivées : utilisez « Vérifier commandes ». "
+                         "Acceptation et relu fini ne garantissent pas la qualité d’image.")
         text = "\n".join(lines)
         self.preview_details.setText(text)
         self.capture_details.setText(text)
@@ -414,7 +455,8 @@ class CameraWidget(QWidget):
         self.btn_open_dir.setToolTip(f"Ouvrir le dossier : {directory}")
         self.btn_open_last.setEnabled(bool(self.model.last_photo and os.path.isfile(self.model.last_photo)))
         self.btn_process_last.setEnabled(bool(self.model.last_acquisition)
-                                         and self.model.controller.can_change_mode)
+                                         and self.model.controller.can_change_mode
+                                         and self.model.proposal is None)
 
     PAGES = {START: 0, PREVIEW_MODE: 1, CAPTURE_MODE: 2, PROCESSING_MODE: 3}
 
@@ -470,6 +512,8 @@ class CameraWidget(QWidget):
     def _guard(self, fn, *a):
         try:
             return fn(*a)
+        except ProposalPending:
+            self._resolve_proposal_prompt()
         except (ModeError, ProfileMissing) as e:
             self._error("Action indisponible.", e)
         except Exception as e:  # recoverable error shown, never crashes the UI
@@ -502,6 +546,9 @@ class CameraWidget(QWidget):
                 return
             except NeedsDecision:
                 decision = self._ask_unsaved()
+            except ProposalPending:
+                if not self._resolve_proposal_prompt():
+                    return
             except Exception as e:
                 self._error("Impossible de passer en Traitement.", e)
                 return
@@ -549,6 +596,9 @@ class CameraWidget(QWidget):
                 return
             except NeedsDecision:
                 decision = self._ask_unsaved()
+            except ProposalPending:
+                if not self._resolve_proposal_prompt():
+                    return
             except (ModeError, ProfileMissing) as e:
                 self._error("Enregistrez un profil valide avant de passer en Capture.", e); return
             except Exception as e:
@@ -564,7 +614,199 @@ class CameraWidget(QWidget):
         box.setDefaultButton(b_stay)
         box.exec()
         clicked = box.clickedButton()
+        if clicked is b_save and self.model.banks is not None:
+            return SAVE if self._save_bank_target() else STAY
         return SAVE if clicked is b_save else DISCARD if clicked is b_drop else STAY
+
+    def _refresh_banks(self, selected=None):
+        if self.model.banks is None:
+            return
+        selected = selected or self.bank_combo.currentData()
+        try:
+            banks = self.model.list_banks()
+        except Exception as error:
+            self._error("Impossible de lire la liste des banks.", error)
+            return
+        self._bank_entries = {bank.id: bank for bank in banks}
+        self.bank_combo.blockSignals(True)
+        self.bank_combo.clear()
+        self.bank_combo.addItem("Choisir une bank cible", None)
+        for bank in banks:
+            self.bank_combo.addItem(f"{bank.name} · révision {bank.revision}", bank.id)
+        self.bank_combo.setCurrentIndex(max(0, self.bank_combo.findData(selected)))
+        self.bank_combo.blockSignals(False)
+
+    def _create_bank(self):
+        name, accepted = QInputDialog.getText(self, "Créer une bank", "Nom de la nouvelle bank :")
+        if not accepted:
+            return False
+        bank = self._guard(self.model.create_bank, name)
+        if bank is None:
+            return False
+        self._refresh_banks(bank.id)
+        self._refresh_preview_state()
+        return True
+
+    def _save_bank_target(self):
+        bank_id = self.bank_combo.currentData()
+        if bank_id is None:
+            return self._create_bank()
+        try:
+            bank = self.model.banks.get(bank_id)
+            answer = QMessageBox.question(
+                self, "Remplacer la bank",
+                f"Remplacer « {bank.name} », révision {bank.revision}, par les réglages courants ?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            saved = self.model.save_bank(bank_id, confirm_replace=True,
+                                         expected_revision=bank.revision)
+        except Exception as error:
+            self._error("Impossible d’enregistrer la bank.", error)
+            return False
+        self._refresh_banks(saved.id)
+        self._refresh_preview_state()
+        return True
+
+    def _load_bank(self):
+        bank_id = self.bank_combo.currentData()
+        if bank_id is None:
+            self._info("Choisissez une bank à charger.")
+            return
+        decision = None
+        while True:
+            try:
+                if self.model.load_bank(bank_id, decision):
+                    self._refresh_preview_state()
+                return
+            except NeedsDecision:
+                decision = self._ask_unsaved()
+            except ProposalPending:
+                if not self._resolve_proposal_prompt():
+                    return
+            except Exception as error:
+                self._error("Impossible de charger cette bank.", error)
+                return
+
+    def _probe_controls(self):
+        self._guard(self.model.controller.probe_controls)
+        self._set_capture_busy(not self.model.controller.can_change_mode)
+
+    def _adjustment_options(self):
+        from ..auto_adjust import AdjustmentOptions
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Auto-ajustement borné")
+        form = QFormLayout(dialog)
+        note = QLabel("Région de cadrage du preview (pas le champ photo garanti) : "
+                      "x, y, largeur et hauteur normalisés entre 0 et 1. "
+                      "Exposition et gain : bornes choisies par l’opérateur dans les unités du backend, "
+                      "sans convention MSMF/DShow présumée. Focus manuel fixé, sans autofocus.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        roi = []
+        for name, value in (("x", 0), ("y", 0), ("largeur", 1), ("hauteur", 1)):
+            spin = QDoubleSpinBox(dialog)
+            spin.setRange(0, 1)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.05)
+            spin.setValue(value)
+            spin.setObjectName("roi_" + name)
+            form.addRow("Région · " + name, spin)
+            roi.append(spin)
+        bounds = {}
+        steps = {}
+        for name in ("exposure", "gain"):
+            pair = []
+            for bound in ("minimum", "maximum"):
+                field = QLineEdit(dialog)
+                field.setObjectName(name + "_" + bound)
+                field.setPlaceholderText("Valeur backend obligatoire")
+                form.addRow(("Exposition" if name == "exposure" else "Gain") + " · " + bound, field)
+                pair.append(field)
+            bounds[name] = pair
+            field = QLineEdit(dialog)
+            field.setObjectName(name + "_step")
+            field.setPlaceholderText("Pas positif dans les unités du backend")
+            form.addRow(("Exposition" if name == "exposure" else "Gain") + " · pas", field)
+            steps[name + "_step"] = field
+        controls = {}
+        for name, label, low, high, value in (
+            ("max_iterations", "Itérations maximum", 3, 1000, 20),
+            ("time_budget", "Budget temps (secondes)", 1, 3600, 15),
+            ("settle_frames", "Frames de stabilisation", 0, 1000, 2),
+        ):
+            spin = QSpinBox(dialog)
+            spin.setRange(low, high)
+            spin.setValue(value)
+            spin.setObjectName(name)
+            form.addRow(label, spin)
+            controls[name] = spin
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        region = tuple(spin.value() for spin in roi)
+        if region[2] <= 0 or region[3] <= 0 or region[0] + region[2] > 1 or region[1] + region[3] > 1:
+            raise ValueError("La région doit être non vide et entièrement dans le preview.")
+        ranges = {name + "_bounds": tuple(float(field.text()) for field in fields)
+                  for name, fields in bounds.items()}
+        for pair in ranges.values():
+            if not all(math.isfinite(value) for value in pair) or pair[0] >= pair[1]:
+                raise ValueError("Les bornes backend doivent être finies et croissantes.")
+        options = AdjustmentOptions(roi=region, **ranges,
+                                    **{name: float(field.text()) for name, field in steps.items()},
+                                    **{name: spin.value() for name, spin in controls.items()})
+        options.validate()
+        return options
+
+    def _auto_adjust(self):
+        draft = self.model.draft
+        if (draft is None or draft.focus_requested is None or
+                draft.auto_exposure_mode != "manual" or draft.auto_exposure is None):
+            self._info("Fixez le focus et choisissez explicitement le mode d’exposition manuel "
+                       "avec sa valeur backend avant l’auto-ajustement.")
+            return
+        try:
+            options = self._adjustment_options()
+            if options is None:
+                return
+            self.model.start_auto_adjustment(options)
+            self.adjustment_summary.setText("Auto-ajustement en cours. Aucun réglage n’est sauvegardé.")
+            self.adjustment_summary.show()
+            self._refresh_preview_state()
+        except Exception as error:
+            self._error("Impossible de lancer l’auto-ajustement.", error)
+
+    def _accept_proposal(self):
+        self._guard(self.model.validate_proposal)
+        self._refresh_preview_state()
+
+    def _reject_proposal(self):
+        self._guard(self.model.reject_proposal)
+        self._proposal_restoring = (self.model.proposal is not None
+                                   and not self.model.controller.can_change_mode)
+        self._refresh_preview_state()
+
+    def _resolve_proposal_prompt(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("Proposition en attente")
+        box.setText("Validez ou rejetez la proposition avant de continuer. Valider ne sauvegarde pas.")
+        accept = box.addButton("Valider", QMessageBox.ButtonRole.AcceptRole)
+        reject = box.addButton("Rejeter", QMessageBox.ButtonRole.DestructiveRole)
+        stay = box.addButton("Rester", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(stay)
+        box.exec()
+        if box.clickedButton() is accept:
+            self._accept_proposal()
+            return self.model.proposal is None
+        if box.clickedButton() is reject:
+            self._reject_proposal()
+            self._info("Attendez la restauration des réglages, puis réessayez cette action.")
+        return False
 
     def _focus_input(self, value: int, from_slider: bool) -> None:
         if self.model.mode != PREVIEW_MODE:
@@ -622,7 +864,9 @@ class CameraWidget(QWidget):
         self.focus_slider.blockSignals(False)
 
     def _save(self):
-        if self._guard(self.model.save_profile) is not None:
+        saved = (self._save_bank_target() if self.model.banks is not None
+                 else self._guard(self.model.save_profile) is not None)
+        if saved:
             self.preview_msg.clear(); self.preview_msg.hide()
         self._refresh_preview_state()
 
@@ -633,15 +877,68 @@ class CameraWidget(QWidget):
             self.result_label.hide()
 
     def _set_capture_busy(self, busy: bool) -> None:
+        busy = busy or self.model.controller.state in ("adjusting", "restoring")
+        pending_proposal = self.model.proposal is not None
         for b in (self.btn_trigger, self.btn_c_preview, self.btn_p_capture,
                   self.btn_to_capture, self.btn_to_preview, self.capture_mode_combo, self.tabs,
                   self.btn_process_last, self.path_combo, self.cam_combo, self.detect_button):
-            b.setEnabled(not busy)
-        if not busy:
+            b.setEnabled(not busy and not pending_proposal)
+        self._refresh_editability(busy)
+        if not busy and not pending_proposal:
             prof = self.model.saved
             self.btn_trigger.setEnabled(bool(prof and prof.is_valid and prof.path == self.model.path)
                                         and not self.model.controller.camera_fault)
             self._refresh_open_buttons()
+
+    def _control_available(self, name):
+        if self.model.banks is None:
+            return True
+        report = self.model.capabilities.get(name)
+        readback = getattr(report, "readback", None)
+        try:
+            return bool(report and report.accepted is True and not report.error
+                        and not report.readback_error and readback is not None and math.isfinite(readback))
+        except (TypeError, ValueError):
+            return False
+
+    def _refresh_editability(self, busy=False):
+        state = self.model.controller.state
+        busy = busy or state in ("adjusting", "restoring")
+        proposal = self.model.proposal is not None
+        editable = (self.model.mode == PREVIEW_MODE and not self.model.pending
+                    and self.model.controller.can_change_mode and not busy and not proposal)
+        for control in (self.btn_save, self.fps_spin, self.bank_combo,
+                        self.btn_create_bank, self.btn_load_bank):
+            control.setEnabled(editable)
+        for control in (self.focus_slider, self.focus_spin):
+            control.setEnabled(editable and self._control_available("focus"))
+        draft = self.model.draft
+        for name, control in self.camera_settings_inputs.items():
+            auto = (name in ("exposure", "gain") and
+                    getattr(draft, "auto_exposure_mode", None) == "automatic") or (
+                        name == "wb_temperature" and getattr(draft, "auto_wb_mode", None) == "automatic")
+            control.setEnabled(editable and not auto and self._control_available(name))
+            if self.model.banks is not None and name not in self.model.capabilities:
+                control.setToolTip("Commande inconnue : utilisez « Vérifier commandes » avant de modifier.")
+        for name, selector in self.camera_mode_inputs.items():
+            selector.setEnabled(editable and self._control_available(name.removesuffix("_mode")))
+            if self.model.banks is not None and name.removesuffix("_mode") not in self.model.capabilities:
+                selector.setToolTip("Commande inconnue : utilisez « Vérifier commandes ».")
+        if self.model.banks is not None and "focus" not in self.model.capabilities:
+            for control in (self.focus_slider, self.focus_spin):
+                control.setToolTip("Focus indisponible tant que « Vérifier commandes » n’a pas confirmé "
+                                   "l’acceptation et un relu fini. Aucun autofocus.")
+        self.btn_probe_controls.setEnabled(editable)
+        self.btn_probe_controls.setVisible(self.model.banks is not None)
+        self.btn_adjust.setVisible(self.model.banks is not None)
+        self.btn_adjust.setEnabled(editable and all(self._control_available(name)
+                                                   for name in ("focus", "auto_exposure", "exposure", "gain")))
+        self.btn_cancel_adjustment.setEnabled(state == "adjusting" and not self._proposal_restoring)
+        self.btn_cancel_adjustment.setVisible(state in ("adjusting", "restoring"))
+        self.btn_accept_proposal.setEnabled(proposal and not busy)
+        self.btn_reject_proposal.setEnabled(proposal and not busy)
+        self.btn_accept_proposal.setVisible(proposal)
+        self.btn_reject_proposal.setVisible(proposal)
 
     def _open_dir(self):
         d = self._directory_to_open()
@@ -665,7 +962,68 @@ class CameraWidget(QWidget):
 
     # ---- events (UI thread) ----
     def _on_event(self, event: str, kw: dict) -> None:
-        if event == "frame":
+        if event == "bank_changed":
+            self._refresh_banks(kw["bank"].id)
+            self._refresh_preview_state()
+        elif event == "camera_capabilities":
+            self._record_camera_reports(kw["reports"], "Commandes vérifiées")
+            for name, report in kw["reports"].items():
+                text = (f"Demandé : {report.requested} · accepté : {report.accepted} · "
+                        f"relu : {report.readback} · "
+                        f"{'disponible' if self._control_available(name) else 'indisponible'}. "
+                        "Le relu ne garantit ni effet physique ni qualité d’image.")
+                if name in self.camera_settings_inputs:
+                    self.camera_settings_inputs[name].setToolTip(text)
+                if name + "_mode" in self.camera_mode_inputs:
+                    self.camera_mode_inputs[name + "_mode"].setToolTip(text)
+                if name == "focus":
+                    self.focus_slider.setToolTip(text)
+                    self.focus_spin.setToolTip(text)
+            self._refresh_preview_state()
+            if kw.get("error"):
+                self._error("Impossible de vérifier les commandes caméra.", kw["error"])
+        elif event in ("adjustment_started", "adjustment_proposed", "adjustment_restored",
+                       "adjustment_failed", "adjustment_restoration_started", "proposal_resolved"):
+            warnings = kw.get("warnings", kw.get("restoration_warnings", []))
+            if event in ("adjustment_restored", "adjustment_failed", "proposal_resolved"):
+                self._proposal_restoring = False
+            if event == "adjustment_restoration_started":
+                self.adjustment_summary.setText("Restauration des réglages en cours. "
+                                                "Attendez la fin avant de réessayer une action.")
+            elif event == "adjustment_proposed":
+                result = kw["result"]
+                converged = getattr(result, "converged", False)
+                reason = {
+                    "converged": "critères atteints",
+                    "max_iterations": "limite d’itérations",
+                    "time_budget": "budget temps atteint",
+                    "criteria_not_met": "critères non atteints",
+                }.get(getattr(result, "stop_reason", ""), "arrêt à vérifier")
+                self.adjustment_summary.setText(
+                    f"{'Critères atteints' if converged else 'Candidat seulement, critères non atteints'} "
+                    f"· {reason}\nAvant : {result.before}\nProposé : {result.proposed}\n"
+                    f"Mesures : {getattr(result, 'metrics', '–')}\n"
+                    f"Itérations : {getattr(result, 'iterations', '–')} · "
+                    f"durée : {getattr(result, 'elapsed', '–')} s\n"
+                    "Valider modifie seulement les réglages courants, sans sauvegarder.")
+            elif event == "adjustment_failed":
+                self.adjustment_summary.setText(
+                    "Auto-ajustement interrompu. " +
+                    ("Restauration non vérifiée/incomplète." if warnings
+                     else "Aucun avertissement de restauration signalé."))
+                self._error("Auto-ajustement interrompu.", kw.get("error", "échec"))
+            elif event in ("adjustment_restored", "proposal_resolved"):
+                self.adjustment_summary.setText(
+                    ("Restauration non vérifiée/incomplète." if warnings else "Réglages restaurés.")
+                    if event == "adjustment_restored"
+                    else "Proposition validée dans le brouillon, non sauvegardée.")
+            if warnings:
+                self.adjustment_summary.setText(self.adjustment_summary.text() +
+                                                "\nRestauration à vérifier : " + str(warnings))
+                self._technical["Restauration à vérifier"] = str(warnings)
+            self.adjustment_summary.show()
+            self._refresh_preview_state()
+        elif event == "frame":
             f = self.model.controller.take_frame()
             if f is not None and self.model.mode == PREVIEW_MODE:
                 img = bgr_to_qimage(f)
@@ -780,6 +1138,7 @@ class CameraWidget(QWidget):
         if d is None:
             return
         self._sync_camera_settings(d)
+        self._set_capture_busy(not self.model.controller.can_change_mode)
         self._sync_focus_controls(d.focus_requested)
         self.fps_spin.blockSignals(True)
         self.fps_spin.setValue(round(d.fps or MODES[d.path].fps))
@@ -811,14 +1170,18 @@ class CameraWidget(QWidget):
     # ---- closing ----
     def can_close(self) -> bool:
         """False if the window must stay open (capture running, or user stays in Preview)."""
-        if self.model.controller.state in ("capturing", "processing"):
+        if not self.model.controller.can_change_mode or self.model.pending:
             self._info("Une opération est en cours : attendez la fin avant de fermer.")
+            return False
+        if self.model.proposal is not None and not self._resolve_proposal_prompt():
             return False
         if self.model.has_unsaved():
             d = self._ask_unsaved()
             if d == STAY:
                 return False
-            if d == SAVE and self._guard(self.model.save_profile) is None:
+            if (d == SAVE and self.model.has_unsaved() and
+                    (not self._save_bank_target() if self.model.banks is not None
+                     else self._guard(self.model.save_profile) is None)):
                 return False
         return True
 

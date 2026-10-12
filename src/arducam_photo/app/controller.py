@@ -2,6 +2,8 @@
 
 States (guarded by a lock): idle -> opening -> preview -> closing -> idle,
 and idle -> capturing / processing / probing -> idle.
+Adjustment/restoration reserve preview -> adjusting/restoring -> preview; no preview pump runs
+inside these exclusive worker sequences.
 Preview and capture can never hold the camera together: capture requires ``idle`` and preview
 opening requires ``idle``. Events go to ``listener(event, **payload)`` from the worker thread;
 a UI must marshal them (Qt queued signal). Frame notifications are bounded: at most one is
@@ -14,6 +16,8 @@ Limits: OpenCV open/set/read/release are native, not interruptible, and no timeo
 from __future__ import annotations
 
 import dataclasses
+import copy
+import json
 import logging
 import queue
 import threading
@@ -36,6 +40,8 @@ log = logging.getLogger("arducam_photo")
 
 IDLE, OPENING, PREVIEW, CLOSING, CAPTURING = "idle", "opening", "preview", "closing", "capturing"
 PROCESSING = "processing"
+ADJUSTING = "adjusting"
+RESTORING = "restoring"
 THUMB_MAX = 1280
 
 
@@ -47,6 +53,16 @@ class ModeError(CaptureError):
 class CaptureJob:
     config: CaptureConfig  # frozen copy of the profile-derived configuration
     photo_dir: str
+    bank_snapshot: Optional[str] = None
+
+    def __post_init__(self):
+        if self.bank_snapshot is not None:
+            snapshot = (json.loads(self.bank_snapshot) if isinstance(self.bank_snapshot, str)
+                        else self.bank_snapshot)
+            if not isinstance(snapshot, dict):
+                raise ValueError("bank snapshot must be a JSON object")
+            object.__setattr__(self, "bank_snapshot",
+                               json.dumps(snapshot, ensure_ascii=False, allow_nan=False))
 
 
 def _thumbnail(image: np.ndarray) -> np.ndarray:
@@ -107,6 +123,8 @@ class CameraController:
         self._acq_times: deque = deque(maxlen=64)
         self._disp_times: deque = deque(maxlen=64)
         self._cancel = threading.Event()
+        self._adjust_cancel = threading.Event()
+        self._adjust_original = None
 
     # ---- public, thread-safe ----
     @property
@@ -153,14 +171,45 @@ class CameraController:
         self._submit(("close",))
 
     def set_focus(self, value: int) -> None:
-        if self._state not in (OPENING, PREVIEW):
-            raise ModeError("réglage du focus uniquement pendant le preview")
-        self._submit(("focus", int(value)))
+        with self._lock:
+            if self._state not in (OPENING, PREVIEW):
+                raise ModeError("réglage du focus uniquement pendant le preview")
+            self._q.put(("focus", int(value)))
 
     def apply_camera_settings(self, values: dict) -> None:
-        if self._state not in (OPENING, PREVIEW):
-            raise ModeError("réglages caméra uniquement pendant le preview")
-        self._submit(("settings", dict(values)))
+        with self._lock:
+            if self._state not in (OPENING, PREVIEW):
+                raise ModeError("réglages caméra uniquement pendant le preview")
+            self._q.put(("settings", dict(values)))
+
+    def auto_adjust(self, before: dict, options) -> None:
+        """Reserve Preview before scheduling the exclusive, cancellable worker sequence."""
+        before, options = copy.deepcopy(before), copy.deepcopy(options)
+        with self._lock:
+            if self._state != PREVIEW:
+                raise ModeError(f"ajustement impossible (état {self._state})")
+            self._state = ADJUSTING
+            self._adjust_cancel.clear()
+            self._q.put(("adjust", before, options))
+
+    def cancel_adjustment(self) -> None:
+        self._adjust_cancel.set()
+
+    def reject_adjustment(self, before: dict) -> None:
+        before = copy.deepcopy(before)
+        with self._lock:
+            if self._state != PREVIEW:
+                raise ModeError(f"restauration impossible (état {self._state})")
+            self._state = RESTORING
+            self._q.put(("restore_adjustment", before))
+
+    def probe_controls(self) -> None:
+        """Probe existing Preview controls only on explicit request, never on open."""
+        with self._lock:
+            if self._state != PREVIEW:
+                raise ModeError(f"détection des contrôles impossible (état {self._state})")
+            self._state = "probing_controls"
+            self._q.put(("probe_controls",))
 
     def capture(self, job: CaptureJob) -> None:
         """Reserve the camera synchronously (double trigger refused) and run on the worker."""
@@ -209,6 +258,7 @@ class CameraController:
         if t is None:
             return True
         self._cancel.set()
+        self._adjust_cancel.set()
         self._q.put(("stop",))
         t.join(timeout)
         return not t.is_alive()
@@ -271,6 +321,12 @@ class CameraController:
             self._do_focus(cmd[1])
         elif kind == "settings":
             self._do_settings(cmd[1])
+        elif kind == "adjust":
+            self._do_adjustment(cmd[1], cmd[2])
+        elif kind == "restore_adjustment":
+            self._do_restore_adjustment(cmd[1])
+        elif kind == "probe_controls":
+            self._do_probe_controls()
         elif kind == "capture":
             self._do_capture(cmd[1])
         elif kind in ("load", "process", "save_processed"):
@@ -306,6 +362,7 @@ class CameraController:
             self._emit("preview_failed", error=e)
             return
         self._session = session
+        self._adjust_original = None
         self.clear_frame()
         self._set_state(PREVIEW)
         self._emit("preview_opened", settings=settings)
@@ -346,6 +403,9 @@ class CameraController:
                        accepted=report.accepted, readback=report.readback)
 
     def _pump_frame(self) -> None:
+        if self._state != PREVIEW:
+            time.sleep(0.005)
+            return
         frame = self._session.read()
         if frame is None:
             if self._session.failed_reads and self._session.failed_reads % 50 == 0:
@@ -360,6 +420,60 @@ class CameraController:
         if notify:
             self._emit("frame")
 
+    def _do_adjustment(self, before, options) -> None:
+        from ..auto_adjust import AutoAdjuster, restore_settings
+
+        self.clear_frame()
+        self._adjust_original = None
+        self._emit("adjustment_started")
+        try:
+            result = AutoAdjuster().run(
+                self._session, before, options,
+                lambda: self._adjust_cancel.is_set() or self._cancel.is_set())
+            if self._adjust_cancel.is_set() or self._cancel.is_set():
+                self._set_state(RESTORING)
+                self._emit("adjustment_restoration_started")
+                try:
+                    warnings = restore_settings(self._session, result.original_settings)
+                except Exception as restore_error:
+                    warnings = [f"restoration failed: {restore_error}"]
+                error = RuntimeError("adjustment cancelled")
+                error.restoration_warnings = warnings
+                raise error
+        except Exception as error:
+            self._set_state(PREVIEW)
+            self._emit("adjustment_failed", error=_detach_error(error),
+                       restoration_warnings=list(getattr(error, "restoration_warnings", ())))
+        else:
+            self._adjust_original = copy.deepcopy(getattr(result, "original_settings", None))
+            self._set_state(PREVIEW)
+            self._emit("adjustment_proposed", result=result)
+
+    def _do_restore_adjustment(self, before) -> None:
+        from ..auto_adjust import restore_settings
+
+        self.clear_frame()
+        self._emit("adjustment_restoration_started")
+        try:
+            warnings = restore_settings(
+                self._session, self._adjust_original if self._adjust_original is not None else before)
+        except Exception as error:
+            warnings = [f"restoration failed: {error}"]
+        self._adjust_original = None
+        self._set_state(PREVIEW)
+        self._emit("adjustment_restored", warnings=warnings)
+
+    def _do_probe_controls(self) -> None:
+        try:
+            reports = self._session.probe_controls()
+        except Exception as error:
+            self._set_state(PREVIEW)
+            self._emit("camera_capabilities", reports={}, error=_detach_error(error))
+        else:
+            self._set_state(PREVIEW)
+            self._emit("camera_capabilities", reports=reports,
+                       limitation="Driver accepted is not proof of physical image effect.")
+
     def _do_capture(self, job: CaptureJob) -> None:
         if not self.legacy_capture:
             self._do_archived_capture(job)
@@ -371,6 +485,10 @@ class CameraController:
                 load_ccm_file(cfg.ccm_path)  # fail before the camera is touched
             self._emit("capture_step", step="Acquisition et traitement (moteur, appel bloquant)")
             result = self._capture_fn(dataclasses.replace(job.config), cancel_event=self._cancel)
+            if job.bank_snapshot is not None:
+                result = dataclasses.replace(
+                    result, info=dataclasses.replace(
+                        result.info, bank_snapshot=json.loads(job.bank_snapshot)))
             try:
                 self._emit("capture_step", step="Enregistrement du PNG")
                 ensure_dir(job.photo_dir)
@@ -399,6 +517,10 @@ class CameraController:
         try:
             self._emit("capture_step", step="Acquisition de l’original")
             acquisition = engine.acquire(job.config, cancel_event=self._cancel, _opener=self._opener)
+            if job.bank_snapshot is not None:
+                acquisition = dataclasses.replace(
+                    acquisition, info=dataclasses.replace(
+                        acquisition.info, bank_snapshot=json.loads(job.bank_snapshot)))
             timings["acquisition_s"] = self._clock() - started
             stage = "archive"
             release_error = getattr(acquisition.info, "release_error", None)

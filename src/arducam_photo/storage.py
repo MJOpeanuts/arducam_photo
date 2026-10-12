@@ -17,7 +17,7 @@ from .errors import CameraSetupError, SaveError
 
 def begin_capture_bundle(acquisition, directory) -> str:
     """Publish verified RAW (when available) and a strict per-capture JSON manifest."""
-    from .archive import _jsonable, _versions
+    from .archive import _control_provenance, _jsonable, _split_requested_parameters, _versions
     from .config import NATIVE_108MP
 
     directory = os.path.abspath(os.fspath(directory))
@@ -82,9 +82,13 @@ def begin_capture_bundle(acquisition, directory) -> str:
                       "reason": f"{info.path} is a color capture; no native Bayer RAW is available"}
 
     config = _jsonable(info.config)
+    shooting, post_processing = _split_requested_parameters(config)
     versions = _versions()
     data = {
         "schema_version": 1, "capture_id": capture_id, "captured_at": info.captured_at,
+        "bank_snapshot": _jsonable(getattr(info, "bank_snapshot", None)),
+        "control_provenance": _control_provenance(_jsonable(info)),
+        "post_processing": {"requested": post_processing},
         "program": {"version": versions.get("program"), "commit": versions.get("commit")},
         "acquisition": {
             "path": info.path, "camera": {
@@ -93,7 +97,7 @@ def begin_capture_bundle(acquisition, directory) -> str:
             },
             "transport_dimensions": list(info.transport_size),
             "image_dimensions": list(original.shape[:2][::-1]),
-            "dtype": info.dtype, "requested_parameters": config,
+            "dtype": info.dtype, "requested_parameters": shooting,
             "parameter_reports": _jsonable(info.settings),
             "readback_at": info.settings_readback_at,
             "readback_note": info.settings_readback_note,

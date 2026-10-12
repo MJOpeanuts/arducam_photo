@@ -7,12 +7,14 @@ Blocking native calls (open, set, read) cannot be interrupted or timed out from 
 from __future__ import annotations
 
 import logging
+import math
+from numbers import Real
 from typing import Callable, Optional
 
 import numpy as np
 
 from .. import engine
-from ..camera_settings import apply_camera_settings
+from ..camera_settings import _ORDER, apply_camera_settings
 from ..config import PATHS, SettingReport
 from ..engine import _import_cv2, _open_video_capture
 from ..errors import CameraOpenError, CameraSetupError, CaptureBusyError
@@ -96,6 +98,59 @@ class PreviewSession:
             raise CameraSetupError("preview non ouvert")
         reports = apply_camera_settings(self._cap, values, _import_cv2())
         self.settings.update(reports)
+        return reports
+
+    def snapshot_settings(self) -> dict:
+        """Read observed controls; absent/nonfinite values are unavailable, not defaults."""
+        if self._cap is None:
+            raise CameraSetupError("preview non ouvert")
+        cv2 = _import_cv2()
+        observed = {}
+        for name, constant in _ORDER:
+            prop = getattr(cv2, constant, None)
+            value = None
+            if prop is not None:
+                try:
+                    readback = self._cap.get(prop)
+                    if (isinstance(readback, Real) and not isinstance(readback, bool)
+                            and math.isfinite(readback)):
+                        value = float(readback)
+                except Exception:
+                    pass
+            observed[name] = value
+        # Backend numbers cannot establish portable automatic/manual mode semantics.
+        observed["auto_exposure_mode"] = None
+        observed["auto_wb_mode"] = None
+        return observed
+
+    def probe_controls(self) -> dict:
+        """Explicit read/set-same-value probe: driver acceptance is not image-effect proof."""
+        observed = self.snapshot_settings()
+        cv2 = _import_cv2()
+        reports = {}
+        for name, constant in _ORDER:
+            value = observed[name]
+            if value is None:
+                reports[name] = SettingReport(
+                    None, None, attempted=False, readback_error="observed value unavailable")
+                continue
+            accepted, error, readback_error, readback = None, None, None, None
+            prop = getattr(cv2, constant)
+            try:
+                accepted = bool(self._cap.set(prop, value))
+            except Exception as exc:
+                error = str(exc)
+            try:
+                current = self._cap.get(prop)
+                if (isinstance(current, Real) and not isinstance(current, bool)
+                        and math.isfinite(current)):
+                    readback = float(current)
+                else:
+                    readback_error = "nonfinite or nonnumeric driver readback"
+            except Exception as exc:
+                readback_error = str(exc)
+            reports[name] = SettingReport(
+                value, accepted, readback, error=error, readback_error=readback_error)
         return reports
 
     def read(self) -> Optional[np.ndarray]:
