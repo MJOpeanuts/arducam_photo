@@ -355,7 +355,7 @@ def test_global_fullscreen_restores_window(window, qapp, mode, maximized, exit_k
     assert set(qapp.topLevelWidgets()) == top_levels
     assert widget.footer.isVisible()
     assert widget.rect().contains(widget.footer.geometry())
-    assert all(b.text() == "Quitter le plein écran" for b in widget._fullscreen_controls)
+    assert all(b.text() == "Mode fenêtré" for b in widget._fullscreen_controls)
     assert (widget.btn_save if mode == PREVIEW_MODE else widget.btn_trigger).isVisible()
     QTest.keyClick(focus, exit_key)
     qapp.processEvents()
@@ -393,6 +393,20 @@ def test_diagnostic_fullscreen_and_persistent_preference(window, qapp):
     assert not settings.load().start_fullscreen
 
 
+def test_global_actions_stay_available_outside_diagnostic(window, qapp):
+    from arducam_photo.app.model import PROCESSING_MODE
+
+    widget = window.widget
+    for mode in (PREVIEW_MODE, CAPTURE_MODE, PROCESSING_MODE):
+        show_mode(widget, mode, qapp)
+        assert widget.fullscreen_button.isVisible()
+        assert widget.quit_button.isVisible()
+        assert not widget.preview_diagnostic.isVisible()
+        assert not widget.capture_diagnostic.isVisible()
+    assert "toute l’application" in widget.fullscreen_button.toolTip()
+    assert "proprement" in widget.quit_button.toolTip()
+
+
 def test_processing_uses_same_global_fullscreen(window, qapp):
     from arducam_photo.app.model import PROCESSING_MODE
     show_mode(window.widget, PROCESSING_MODE, qapp)
@@ -413,8 +427,7 @@ def test_quit_uses_existing_guards(window, qapp, monkeypatch):
     show_mode(widget, PREVIEW_MODE, qapp)
     widget.model.draft = dataclasses.replace(widget.model.saved, focus_requested=301)
     monkeypatch.setattr(widget, "_ask_unsaved", lambda: "stay")
-    quit_button = next(b for b in widget.preview_diagnostic.findChildren(QPushButton)
-                       if b.text() == "Quitter l’application")
+    quit_button = widget.quit_button
     quit_button.click()
     assert window.isVisible()
     monkeypatch.setattr(widget, "_info", lambda text: None)
