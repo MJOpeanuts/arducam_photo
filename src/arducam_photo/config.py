@@ -153,6 +153,7 @@ class AcquisitionInfo:
     settings_readback_note: str = "Driver reads are not a synchronized sensor measurement."
     camera_released: bool = False
     release_error: Optional[str] = None
+    bank_snapshot: Optional[dict] = None
 
 
 @dataclass(frozen=True)

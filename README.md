@@ -1,7 +1,7 @@
 # arducam_photo
 
 Lightweight, importable one-shot photo capture for the Arducam B0494C (108 MP UVC), Windows 11 x64.
-The repository has three layers: the **library** (`arducam_photo`), the **CLI examples** (`examples/`) and the **graphical app** (`arducam_photo.app`, PySide6). No Streamlit, browser, server, SQLite or installer.
+The repository has three layers: the **library** (`arducam_photo`), the **CLI examples** (`examples/`) and the **graphical app** (`arducam_photo.app`, PySide6). Banks use a local SQLite file; no Streamlit, browser, server or cloud.
 
 ## API
 
@@ -108,11 +108,131 @@ py -3.12 -m venv .venv
 run_arducam_capture.cmd                                 # double-click launcher
 ```
 
-Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), leave the bundled CCM selected by default, open **Preview / Réglages**, set the focus (0–1023, numeric + slider; no autofocus or calibrated distance), optionally expand **Autres réglages caméra**, **Enregistrer**, go to **Capture**, press **PHOTO**. Each successful photo writes `<capture_id>.raw`, `<capture_id>.json`, and `<capture_id>.png` in the chosen photo folder; 720p writes JSON and PNG only. Existing files are never overwritten.
+Quick trial on your PC: close other camera apps, start the app, choose *Photo 108 MP*, pick the camera (use "Détecter" if needed; the index is not a stable identity), leave the bundled CCM selected by default, open **Preview / Réglages**, verify available controls, set the focus (0–1023, numeric + slider; no autofocus or calibrated distance), optionally expand **Autres réglages caméra**, explicitly create/save a bank, go to **Capture**, press **PHOTO**. Each successful photo writes `<capture_id>.raw`, `<capture_id>.json`, and `<capture_id>.png` in the chosen photo folder; 720p writes JSON and PNG only. Existing files are never overwritten.
 
-**Navigation.** Start: nothing is opened. **Preview** keeps the existing image, focus controls, profile save and save/discard/stay prompt; the framing preview is not a claim about the photo mode's field of view. Leaving it closes and releases the stream. **Capture** has no live video while waiting; its compact mode selector is explicit and an incompatible saved profile cannot be silently reused. PHOTO freezes the configuration. A second trigger and incompatible transitions are refused while work runs. Capture retains the last still image after success or recoverable error and never restarts Preview automatically. **Traitement** loads and processes files without camera access; returning to Capture does not open a stream.
+**Navigation.** Start: nothing is opened. **Preview** keeps the existing image, focus controls, explicit bank save and save/discard/stay prompt; the framing preview is not a claim about the photo mode's field of view. Leaving it closes and releases the stream. **Capture** has no live video while waiting; its compact mode selector is explicit and an incompatible saved bank cannot be silently reused. PHOTO freezes the saved configuration, never a draft/proposal, and never runs auto-adjustment. A second trigger and incompatible transitions are refused while work runs. Capture retains the last still image after success or recoverable error and never restarts Preview automatically. **Traitement** loads and processes files without camera access; returning to Capture does not open a stream.
 
-**Architecture.** Qt-free: `engine.py` acquires, `archive.py` and `storage.py` store/verify, `processing.py` describes reproducible recipes, `app/profile.py` keeps injectable JSON profiles in `%LOCALAPPDATA%\ArducamCapture`, `app/preview.py` adapts the preview, `app/controller.py` serializes worker jobs and `app/model.py` orchestrates modes. Qt: `app/widget.py` and the processing view. One latest preview frame and one outstanding notification prevent a backlog. File loading, ISP and writing stay off the GUI thread; processing concurrency is bounded. Display images are owned copies, not references to driver buffers. Old profiles remain readable with explicit defaults; changing the acquisition mode requires compatible settings. Corrupt profile/settings JSON files are kept (renamed `.corrupt-*`), never deleted.
+**Architecture.** Qt-free: `engine.py` acquires, `archive.py` and `storage.py` store/verify, `processing.py` describes reproducible recipes, `banks.py` provides the injected `BankRepository` and SQLite adapter, `auto_adjust.py` performs bounded image-based searches without Qt/storage, `app/preview.py` adapts the preview, `app/controller.py` serializes worker jobs and `app/model.py` orchestrates modes. Qt: `app/widget.py` and the processing view. One latest preview frame and one outstanding notification prevent a backlog. File loading, ISP and writing stay off the GUI thread; processing concurrency is bounded. Display images are owned copies, not references to driver buffers. `app/profile.py` retains the settings and legacy profile API for existing integrations; the standalone GUI uses banks only. Existing `profiles.json` files are not imported, renamed, overwritten or deleted by bank operations. An import would require a separately reviewed explicit migration, not permanent double persistence.
+
+### Banks, proposition et auto-ajustement à la demande
+
+Parcours : **Preview → réglage manuel ou Auto-ajustement → proposition → Valider/Rejeter
+→ sauvegarde explicite dans la bank choisie → Capture**.
+
+- Une bank est immuable dans la session ; son profil est copié dans le brouillon.
+  Modifier un contrôle ne modifie jamais SQLite. **Valider** adopte la proposition dans
+  le brouillon, sans sauvegarder. **Sauvegarder** remplace explicitement la bank choisie
+  après confirmation et incrémente sa révision, sans prendre de photo.
+- Avant chargement d’une autre bank, sortie de Preview ou fermeture : résoudre la
+  proposition ; puis **Sauvegarder / Abandonner / Rester** pour le brouillon modifié.
+  Une erreur de stockage garde les modifications en mémoire. Un contexte caméra/backend
+  incompatible est refusé ; un index OpenCV reste une identité fragile à vérifier.
+- **Vérifier les commandes** est une action explicite sur la caméra déjà ouverte :
+  relecture puis essai de la même valeur. Inconnus/indisponibles restent désactivés.
+  Consigne, acceptation pilote et relecture sont distinctes ; même une commande acceptée
+  ne prouve pas un effet physique. Les unités, plages et nombres auto/manuels doivent
+  être vérifiés pour le pilote et le backend utilisé ; aucune équivalence MSMF/DirectShow
+  n’est déduite.
+- Cadrer le marquage, régler le focus manuellement, indiquer la zone normalisée
+  `(x, y, largeur, hauteur)` et des bornes/pas d’exposition et de gain documentés pour
+  le matériel. Cette première version exige un mode d’exposition **manuel** renseigné
+  explicitement et les deux contrôles disponibles ; elle refuse un ajustement non
+  vérifiable plutôt que d’inventer une convention de bascule.
+- Le service conserve les valeurs/modes précédents, ne touche pas au focus et utilise
+  la session existante sur le worker. La pompe Preview est suspendue ; aucune seconde
+  caméra, aucun PHOTO, changement de bank ou réglage concurrent n’est permis.
+  Après des images de stabilisation, il mesure luminosité moyenne, proportion saturée
+  (au moins un canal) et contraste local (différences voisines). Des essais bornés
+  doivent montrer une réponse mesurable des deux contrôles avant la recherche.
+  Les seuils, ROI, pas, nombre d’itérations et budget sont configurables dans
+  `AdjustmentOptions`. L’arrêt utilise convergence, limite d’itérations, budget ou
+  absence d’amélioration. Une proposition est un candidat mesuré, **pas une garantie
+  de lisibilité du marquage** ni une certification d’effet sur le RAW.
+- Rejeter, annuler ou échouer tente de restaurer les contrôles modifiés et le mode
+  observés avant la recherche. Les observations servent uniquement à cette restauration,
+  jamais comme consignes persistantes. Toute restauration impossible/non vérifiée est
+  affichée. Preview reprend après la séquence. Les appels natifs ne sont pas interruptibles :
+  budget et annulation sont contrôlés entre appels, pas une garantie de délai.
+  **5–10 secondes est un objectif à mesurer sur l’Arducam**, sans attente artificielle.
+
+#### Schéma SQLite et JSON, version 1
+
+Emplacement Windows : **`%LOCALAPPDATA%\ArducamCapture\banks.sqlite3`**,
+indépendant du programme, des photos et de `settings.json`. Sans `LOCALAPPDATA`,
+le repli local est `~/.local/share/ArducamCapture`. Aucun serveur.
+
+Table `banks` :
+
+| Colonne | Format / invariant |
+| --- | --- |
+| `id` | TEXT, UUID stable, clé primaire |
+| `name` | TEXT, nom non vide |
+| `revision` | INTEGER positif, création à 1, +1 à chaque sauvegarde |
+| `schema_version` | INTEGER, 1 actuellement |
+| `config_json` | TEXT, JSON strict validé en lecture et écriture |
+| `created_at`, `updated_at` | TEXT, ISO 8601 avec fuseau, UTC à l’écriture |
+
+`PRAGMA user_version=1` décrit le schéma de la base. Un schéma inconnu, un JSON
+corrompu/non fini, des champs inattendus ou une base préexistante non reconnue donnent
+une erreur explicite, jamais une remise à zéro silencieuse. Les sauvegardes utilisent
+une transaction `BEGIN IMMEDIATE` et la révision attendue pour refuser les conflits.
+
+`config_json` contient deux objets :
+
+- `shooting` : `camera_key`, `camera_index`, `camera_fragile`, `path`, `api`,
+  `focus_requested`, `fps`, `exposure`, `auto_exposure`, `auto_exposure_mode`,
+  `gain`, `auto_wb`, `auto_wb_mode`, `wb_temperature`, `brightness`, `contrast`,
+  `saturation`. Les valeurs nulles signifient « ne pas modifier ».
+  `camera_fragile` expose la limite de l’identité par index ; ce n’est pas un identifiant
+  matériel stable. Modes : null, `manual` ou `automatic`, avec la consigne backend
+  correspondante quand un mode est déterminé.
+- `post_processing` : objet vide en version 1 ; les recettes de rendu/export sont
+  séparées et enregistrées dans les manifestes de traitement, pas rejouées sur la caméra.
+  `focus_readback`, `focus_verified` et `saved_at` ne sont pas des consignes et sont exclus.
+
+PHOTO transporte un snapshot sérialisé indépendant : `id`, `name`, `revision`,
+`schema_version`, `configuration`. Les deux manifestes d’acquisition conservent ce snapshot
+avec les consignes et rapports pilote relus dans le **mode photo**, leurs indisponibilités
+et limites de vérification. La bank peut changer ultérieurement sans modifier les anciens
+fichiers. Un mode sauvegardé automatique reste automatique ; aucune exposition identique
+entre prises n’est promise. Un réglage efficace en Preview 720p n’est pas présumé efficace
+dans le transport RAW natif.
+
+#### Recette Windows Arducam — à exécuter sur matériel
+
+1. Fermer toute autre application caméra ; installer/lancer comme ci-dessus, sur USB 3
+   pour le 108 MP. Relever Windows, OpenCV, pilote, backend et connexion réelle.
+   Copier les anciens profils à titre de sauvegarde et vérifier qu’ils restent inchangés.
+2. En Preview, vérifier les commandes et comparer les valeurs demandées/relues.
+   Tester les refus du pilote : un contrôle indisponible doit être désactivé et expliqué.
+   Vérifier séparément les conventions MSMF et DirectShow avant toute valeur brute.
+3. Cadrer une mire/marquage, régler le focus ; créer deux banks nommées. Modifier le
+   brouillon, charger l’autre bank et essayer successivement Rester, Abandonner,
+   Sauvegarder avec confirmation. Quitter et relancer : vérifier noms, valeurs et révisions.
+4. Choisir ROI et bornes sûres du pilote, exposition manuelle ; lancer Auto-ajustement.
+   Mesurer le délai réel et inspecter luminosité/saturation/contraste. Vérifier le focus
+   inchangé et l’absence de capture, navigation ou commandes concurrentes.
+5. Valider : aucune révision ne doit changer avant sauvegarde explicite.
+   Refaire puis rejeter/annuler : comparer visuellement et relire paramètres **et modes**.
+   Simuler une déconnexion/erreur : pas de faux succès, avertissement si restauration
+   impossible/non vérifiée, aucune écriture de proposition en base.
+6. Sauvegarder dans la bank choisie, confirmer remplacement ; aucune photo ne doit
+   apparaître. Passer en Capture : absence de flux au repos. PHOTO ne lance aucun
+   ajustement et l’application reste en Capture après la prise.
+7. En 108 MP, vérifier Bayer original `.raw` de **108 000 000 octets** sans upscale,
+   JSON avec même `capture_id`, hash/dimensions, bank id/révision/configuration complète,
+   rapports demandés/relus/indisponibles et traitement séparé. Vérifier application des
+   paramètres sur le RAW, indépendamment du Preview. Tester une erreur de rendu :
+   RAW + manifeste doivent rester préservés, sans repli silencieux vers 720p.
+8. Modifier la bank et reprendre une photo : les anciens manifestes doivent rester
+   identiques. Tester le mode sauvegardé automatique sans exiger une exposition identique.
+   Débrancher la caméra et ouvrir Traitement : aucun accès caméra ne doit être nécessaire.
+9. Tester SQLite non accessible/verrouillée/corrompue sur une **copie de la base** :
+   erreurs explicites, brouillon préservé, pas d’écrasement ni de profil de remplacement.
+
+Les tests Linux avec caméra simulée et SQLite temporaire valident les invariants logiciels,
+les erreurs et la traçabilité. Ils ne valident **ni le pilote Windows, ni l’effet physique des
+commandes, ni le focus, ni la qualité du RAW, ni le délai sur l’Arducam**.
 
 ### Original archival and offline processing
 
@@ -131,7 +251,7 @@ No-overwrite publication requires filesystem hard-link support (for example NTFS
 5. Compare source/result with synchronized zoom and pan. The display may use bounded-size views; saved outputs use the recipe's actual dimensions.
 6. Save a **new** PNG (colour/grayscale) or JPEG (configurable quality); source id, recipe and output parameters accompany it. PNG is checked pixel-for-pixel; JPEG is checked for decodability and dimensions, not equality. Reducing a result does not create an acquisition mode. No implicit cropping is performed.
 
-This remains a local camera/photo utility: no campaigns, experiments, annotations, OCR, cloud, server or database. Keep trial notes in Notion.
+This remains a local camera/photo utility: no campaigns, experiments, annotations, OCR, cloud or server; SQLite stores only banks.
 
 **Limits.** OpenCV open/set/read/release are native and non-interruptible: no effective timeout or cancellation is promised; closing the window waits (up to 10 s) for the worker and cannot abort a blocked call. If that shutdown wait expires, controls are disabled; a nonblocking Qt timer checks worker completion and the application exits automatically after the worker finishes and releases the camera. A permanently blocked native call can still prevent exit. The 14.2 s of the first test is neither a guarantee nor an end-to-end UI measure. The "last photo" shown is from the current session only. USB speed is never measured. Do not mix OpenCV distributions.
 

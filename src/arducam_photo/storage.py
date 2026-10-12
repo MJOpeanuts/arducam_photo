@@ -17,7 +17,7 @@ from .errors import CameraSetupError, SaveError
 
 def begin_capture_bundle(acquisition, directory) -> str:
     """Publish verified RAW (when available) and a strict per-capture JSON manifest."""
-    from .archive import _jsonable, _versions
+    from .archive import _control_provenance, _jsonable, _versions
     from .config import NATIVE_108MP
 
     directory = os.path.abspath(os.fspath(directory))
@@ -85,6 +85,8 @@ def begin_capture_bundle(acquisition, directory) -> str:
     versions = _versions()
     data = {
         "schema_version": 1, "capture_id": capture_id, "captured_at": info.captured_at,
+        "bank_snapshot": _jsonable(getattr(info, "bank_snapshot", None)),
+        "control_provenance": _control_provenance(_jsonable(info)),
         "program": {"version": versions.get("program"), "commit": versions.get("commit")},
         "acquisition": {
             "path": info.path, "camera": {

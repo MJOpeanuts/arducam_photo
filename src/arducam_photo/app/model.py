@@ -1,9 +1,10 @@
-"""Qt-free orchestration of Start / Preview / Capture / Processing, profiles and settings."""
+"""Qt-free orchestration of modes, bank snapshots, working settings and proposals."""
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import math
 import os
 from typing import Callable, Optional
@@ -32,10 +33,21 @@ class ProfileMissing(Exception):
     """No valid saved profile: go through Preview / Settings first."""
 
 
+class ProposalPending(Exception):
+    """Validate or reject the proposal before editing or leaving Preview."""
+
+
 class SessionModel:
     def __init__(self, profile_store: ProfileStore, settings_store, listener: Optional[Callable] = None,
-                 *, controller: Optional[CameraController] = None, **controller_kwargs):
+                 *, controller: Optional[CameraController] = None, bank_repository=None,
+                 **controller_kwargs):
         self.profiles, self.settings_store = profile_store, settings_store
+        self.banks = bank_repository
+        self.bank = None
+        self.proposal = None
+        self._adjust_before = None
+        self.restoration_warnings = []
+        self.capabilities = {}
         self._ui = listener or (lambda event, **kw: None)
         self.controller = controller or CameraController(self._on_event, **controller_kwargs)
         if controller is not None:
@@ -100,7 +112,13 @@ class SessionModel:
     def has_unsaved(self) -> bool:
         return self.mode == PREVIEW_MODE and self.draft is not None and not self.draft.same_settings(self.saved)
 
+    def _editable(self) -> None:
+        self._require_mode(PREVIEW_MODE)
+        if self.proposal is not None:
+            raise ProposalPending("Validez ou rejetez la proposition avant de continuer.")
+
     def set_focus(self, value: int) -> None:
+        self._editable()
         if self.mode != PREVIEW_MODE or self.pending:
             raise ModeError("réglage du focus uniquement en Preview")
         if not FOCUS_MIN <= value <= FOCUS_MAX:
@@ -109,6 +127,7 @@ class SessionModel:
         self.draft = dataclasses.replace(self.draft, focus_requested=int(value), focus_readback=None)
 
     def set_camera_control(self, name: str, value: Optional[float]) -> None:
+        self._editable()
         names = {"exposure", "auto_exposure", "gain", "auto_wb", "wb_temperature",
                  "brightness", "contrast", "saturation"}
         if name not in names:
@@ -124,10 +143,12 @@ class SessionModel:
             updates["auto_exposure_mode"] = None
         elif value is None and name == "auto_wb":
             updates["auto_wb_mode"] = None
-        self.draft = dataclasses.replace(self.draft, **updates)
-        self.controller.apply_camera_settings(self._camera_control_values(self.draft))
+        candidate = dataclasses.replace(self.draft, **updates)
+        self.controller.apply_camera_settings(self._camera_control_values(candidate))
+        self.draft = candidate
 
     def set_camera_mode(self, name: str, mode: Optional[str]) -> None:
+        self._editable()
         if name not in ("auto_exposure_mode", "auto_wb_mode") or mode not in (None, "automatic", "manual"):
             raise CaptureConfigError("mode automatique caméra invalide")
         if self.mode != PREVIEW_MODE or self.pending:
@@ -135,8 +156,9 @@ class SessionModel:
         command = "auto_exposure" if name == "auto_exposure_mode" else "auto_wb"
         if mode is not None and getattr(self.draft, command) is None:
             raise CaptureConfigError(f"renseignez la valeur backend {command} avant de choisir un mode")
-        self.draft = dataclasses.replace(self.draft, **{name: mode})
-        self.controller.apply_camera_settings(self._camera_control_values(self.draft))
+        candidate = dataclasses.replace(self.draft, **{name: mode})
+        self.controller.apply_camera_settings(self._camera_control_values(candidate))
+        self.draft = candidate
 
     @staticmethod
     def _camera_control_values(profile):
@@ -150,7 +172,12 @@ class SessionModel:
             "contrast": profile.contrast, "saturation": profile.saturation,
         }
 
-    def save_profile(self) -> ShootingProfile:
+    def save_profile(self, *, confirm_replace: bool = False) -> ShootingProfile:
+        self._editable()
+        if self.banks is not None:
+            if self.bank is None:
+                raise ProfileMissing("Créez ou choisissez une bank pour sauvegarder.")
+            return self.save_bank(self.bank.id, confirm_replace=confirm_replace).profile
         if self.draft is None:
             raise ProfileMissing("aucun réglage à enregistrer")
         problems = self.draft.problems()
@@ -161,7 +188,108 @@ class SessionModel:
         return self.saved
 
     def _load_saved(self) -> None:
-        self.saved = self.profiles.load(self.camera.key)
+        if self.banks is not None:
+            self.saved = self.bank.profile if self.bank is not None else None
+        else:
+            self.saved = self.profiles.load(self.camera.key)
+
+    def list_banks(self):
+        return self.banks.list() if self.banks is not None else []
+
+    def create_bank(self, name: str):
+        self._editable()
+        if self.banks is None:
+            raise ProfileMissing("Stockage des banks non configuré.")
+        bank = self.banks.create(name, self.draft)
+        self.bank, self.saved = bank, bank.profile
+        self.draft = dataclasses.replace(self.saved)
+        self._ui("bank_changed", bank=bank)
+        return bank
+
+    def save_bank(self, bank_id: str, *, confirm_replace: bool = False):
+        self._editable()
+        if self.banks is None:
+            raise ProfileMissing("Stockage des banks non configuré.")
+        if not confirm_replace:
+            raise NeedsDecision("Confirmez le remplacement de la bank choisie.")
+        target = self.bank if self.bank is not None and self.bank.id == bank_id else self.banks.get(bank_id)
+        bank = self.banks.save(bank_id, self.draft, expected_revision=target.revision)
+        self.bank, self.saved = bank, bank.profile
+        self.draft = dataclasses.replace(self.saved)
+        self._ui("bank_changed", bank=bank)
+        return bank
+
+    def _resolve_unsaved(self, decision) -> bool:
+        if self.proposal is not None:
+            raise ProposalPending("Validez ou rejetez la proposition avant de continuer.")
+        if not self.has_unsaved():
+            return True
+        if decision is None:
+            raise NeedsDecision()
+        if decision == STAY:
+            return False
+        if decision == SAVE:
+            self.save_profile(confirm_replace=True)
+        elif decision == DISCARD:
+            self.draft = dataclasses.replace(self.saved) if self.saved else None
+        else:
+            raise ValueError(f"unknown decision {decision!r}")
+        return True
+
+    def load_bank(self, bank_id: str, decision=None) -> bool:
+        self._editable()
+        bank = self.banks.get(bank_id)
+        profile = bank.profile
+        if profile.camera_key != self.camera.key or profile.camera_index != self.camera.index or profile.api != self.api:
+            raise CaptureConfigError("Contexte caméra/backend différent ; choisissez ce contexte avant de charger la bank. "
+                                     "L’index OpenCV ne garantit pas l’identité matérielle.")
+        previous_draft = self.draft
+        if not self._resolve_unsaved(decision):
+            return False
+        try:
+            self.controller.apply_camera_settings(self._camera_control_values(profile))
+        except Exception:
+            if decision == DISCARD:
+                self.draft = previous_draft
+            raise
+        self.bank, self.saved = bank, profile
+        self.draft = dataclasses.replace(profile)
+        self.path = profile.path
+        self._ui("bank_changed", bank=bank)
+        return True
+
+    def start_auto_adjustment(self, options) -> None:
+        self._editable()
+        before = self.draft
+        self._adjust_before = before
+        self.restoration_warnings = []
+        try:
+            self.controller.auto_adjust(self._camera_control_values(before), options)
+        except Exception:
+            self._adjust_before = None
+            raise
+
+    def validate_proposal(self) -> None:
+        self._require_mode(PREVIEW_MODE)
+        if self.proposal is None:
+            raise ProposalPending("Aucune proposition à valider.")
+        names = {"exposure", "gain", "auto_exposure", "auto_exposure_mode"}
+        updates = {k: v for k, v in self.proposal.proposed.items() if k in names}
+        self.draft = dataclasses.replace(self._adjust_before, **updates)
+        self.proposal = None
+        self._adjust_before = None
+        self._ui("proposal_resolved")
+
+    def reject_proposal(self) -> None:
+        self._require_mode(PREVIEW_MODE)
+        if self.proposal is None:
+            raise ProposalPending("Aucune proposition à rejeter.")
+        original = getattr(self.proposal, "original_settings", None)
+        self.controller.reject_adjustment(original if original is not None else self.proposal.before)
+
+    def resolve_preview_exit(self, decision=None) -> bool:
+        self._require_mode(PREVIEW_MODE)
+        return self._resolve_unsaved(decision)
 
     # ---- transitions ----
     def enter_preview(self) -> None:
@@ -169,6 +297,7 @@ class SessionModel:
         self._require_mode(START, CAPTURE_MODE, PROCESSING_MODE)
         leaving_processing = self.mode == PROCESSING_MODE
         self._load_saved()
+        self.capabilities = {}
         base = self.saved or ShootingProfile()
         fps = base.fps
         if base.path != self.path or fps is None or any("cadence" in p for p in base.problems()):
@@ -203,17 +332,8 @@ class SessionModel:
     def _request_mode(self, target: str, decision: Optional[str]) -> bool:
         self._require_mode(START, PREVIEW_MODE, CAPTURE_MODE, PROCESSING_MODE)
         if self.mode == PREVIEW_MODE:
-            if self.has_unsaved():
-                if decision is None:
-                    raise NeedsDecision()
-                if decision == STAY:
-                    return False
-                if decision == SAVE:
-                    self.save_profile()  # on failure we stay in Preview
-                elif decision == DISCARD:
-                    self.draft = self.saved
-                else:
-                    raise ValueError(f"unknown decision {decision!r}")
+            if not self._resolve_unsaved(decision):
+                return False
             self.pending = target
             self.controller.close_preview()  # worker releases the camera, then preview_closed
         else:
@@ -228,7 +348,11 @@ class SessionModel:
     def trigger(self) -> None:
         if self.mode != CAPTURE_MODE or self.pending:
             raise ModeError("le déclencheur n'existe qu'en mode Capture")
-        profile = self.saved
+        if self.proposal is not None:
+            raise ProposalPending("Proposition en attente.")
+        profile = self.bank.profile if self.banks is not None and self.bank is not None else self.saved
+        if self.banks is not None and self.bank is None:
+            raise ProfileMissing("Aucune bank sauvegardée sélectionnée.")
         if profile is None or not profile.is_valid:
             raise ProfileMissing("aucun profil valide: passez par Preview / Réglages")
         if profile.path != self.path:
@@ -252,7 +376,8 @@ class SessionModel:
                             apply_ccm=native)
         cfg = dataclasses.replace(cfg, fps=profile.fps)
         cfg.validate()
-        self.controller.capture(CaptureJob(cfg, self.photo_dir()))  # frozen copy; may raise busy
+        snapshot = json.dumps(self.bank.snapshot(), allow_nan=False) if self.bank is not None else None
+        self.controller.capture(CaptureJob(cfg, self.photo_dir(), bank_snapshot=snapshot))
 
     def ccm_status(self) -> str:
         if self.path != NATIVE_108MP:
@@ -284,7 +409,7 @@ class SessionModel:
         self.controller.save_processed(options)
 
     def set_fps(self, value: float) -> None:
-        self._require_mode(PREVIEW_MODE)
+        self._editable()
         candidate = dataclasses.replace(self.draft, fps=value)
         if any("cadence" in problem for problem in candidate.problems()):
             raise CaptureConfigError("cadence photo hors plage")
@@ -299,7 +424,24 @@ class SessionModel:
 
     # ---- controller events ----
     def _on_event(self, event: str, **kw) -> None:
-        if event == "preview_opened":
+        if event == "adjustment_proposed":
+            self.proposal = kw["result"]
+            self._ui(event, **kw)
+        elif event == "adjustment_failed":
+            self.restoration_warnings = kw.get("restoration_warnings", [])
+            self._adjust_before = None
+            self._ui(event, **kw)
+        elif event == "adjustment_restored":
+            self.restoration_warnings = kw.get("warnings", [])
+            if self._adjust_before is not None:
+                self.draft = self._adjust_before
+            self.proposal = None
+            self._adjust_before = None
+            self._ui(event, **kw)
+        elif event == "camera_capabilities":
+            self.capabilities = kw["reports"]
+            self._ui(event, **kw)
+        elif event == "preview_opened":
             self.mode, self.pending = PREVIEW_MODE, None
             if self.draft:
                 try:

@@ -14,17 +14,22 @@ def configure_windows_app_id():
 
 def main(argv=None) -> int:
     from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QMessageBox
 
+    from ..banks import SQLiteBankRepository
     from .icons import application_icon
     from .model import SessionModel
-    from .profile import JsonProfileStore, JsonSettingsStore
+    from .profile import JsonSettingsStore, StoreError
     from .window import MainWindow
 
     configure_windows_app_id()
     app = QApplication(argv if argv is not None else sys.argv)
     app.setWindowIcon(application_icon())
-    model = SessionModel(JsonProfileStore(), JsonSettingsStore())
+    try:
+        model = SessionModel(None, JsonSettingsStore(), bank_repository=SQLiteBankRepository())
+    except (StoreError, OSError) as error:
+        QMessageBox.critical(None, "Stockage indisponible", str(error))
+        return 1
     win = MainWindow(model)
     win.resize(1280, 720)
     win.show()
